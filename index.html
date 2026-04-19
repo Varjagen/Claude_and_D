@@ -1,0 +1,2767 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import {
+  Shield, Swords, Users, Eye, EyeOff, Plus, Minus, X, Search,
+  Map as MapIcon, Layers, Settings, LogOut, Play, Pause, Crown,
+  ChevronRight, Download, Upload, User, Trash2, Heart, Sparkles,
+  Save, FolderOpen, Lock, ZoomIn, ZoomOut, RotateCcw, Target,
+  Circle, Square, Diamond, Skull, Edit3, ChevronDown, Copy,
+  Swords as SwordsIcon, MoreVertical, UserCheck, Wifi, WifiOff,
+  ArrowRightCircle, Radio, Gem, Scroll, Dices, ChevronLeft,
+  PlusCircle, AlertCircle, Link2, Flag, Home
+} from 'lucide-react';
+
+// ============================================================
+//  CONSTANTS & DEFAULTS
+// ============================================================
+
+const SESSION_KEY = 'vtt_session_v1';
+const DM_PASS_KEY = 'vtt_dmpass_v1';
+const LOCAL_USER_KEY = 'vtt_local_user_v1';
+const DEFAULT_DM_PASSWORD = 'dmpass';
+
+const CONDITIONS = [
+  'Blinded', 'Charmed', 'Deafened', 'Frightened', 'Grappled',
+  'Incapacitated', 'Invisible', 'Paralyzed', 'Petrified',
+  'Poisoned', 'Prone', 'Restrained', 'Stunned', 'Unconscious',
+  'Exhaustion'
+];
+
+const ENTITY_COLORS = [
+  '#d4a437', '#b94a4a', '#4a87a8', '#7aa855', '#9b59b6',
+  '#e67e22', '#95a5a6', '#16a085', '#c0392b', '#2c7873'
+];
+
+const MAP_TYPES = ['world', 'region', 'city', 'dungeon', 'interior', 'other'];
+
+const DEFAULT_STATS = { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 };
+
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+const mod = (score) => Math.floor((score - 10) / 2);
+const formatMod = (score) => { const m = mod(score); return m >= 0 ? `+${m}` : `${m}`; };
+
+function createDefaultSession() {
+  const worldId = uid();
+  const dungeonId = uid();
+  return {
+    version: 1,
+    updatedAt: Date.now(),
+    updatedBy: 'system',
+    maps: [
+      {
+        id: worldId, name: 'The Sword Coast', type: 'world', parentId: null,
+        imageUrl: '', notes: 'The overworld. Drop tokens here for travel encounters.',
+        viewport: { x: 0, y: 0, w: 1200, h: 800 }
+      },
+      {
+        id: dungeonId, name: 'Forgotten Crypt', type: 'dungeon', parentId: worldId,
+        imageUrl: '', notes: 'An ancient tomb beneath the hills.',
+        viewport: { x: 0, y: 0, w: 1200, h: 800 }
+      }
+    ],
+    currentMapId: worldId,
+    entities: [],
+    tokens: [],
+    initiative: { active: false, entries: [], turnIndex: 0, round: 1 },
+    presets: [],
+    forcedView: null,
+    settings: { showAllPCsToPlayers: true },
+    claims: {} // playerName -> entityId
+  };
+}
+
+// ============================================================
+//  STORAGE LAYER (cross-user sync via shared storage)
+// ============================================================
+
+const storage = {
+  async getSession() {
+    try {
+      const r = await window.storage.get(SESSION_KEY, true);
+      return r ? JSON.parse(r.value) : null;
+    } catch { return null; }
+  },
+  async setSession(s) {
+    try {
+      await window.storage.set(SESSION_KEY, JSON.stringify(s), true);
+      return true;
+    } catch { return false; }
+  },
+  async getDMPass() {
+    try {
+      const r = await window.storage.get(DM_PASS_KEY, true);
+      return r ? r.value : null;
+    } catch { return null; }
+  },
+  async setDMPass(pass) {
+    try { await window.storage.set(DM_PASS_KEY, pass, true); return true; }
+    catch { return false; }
+  },
+  async getLocalUser() {
+    try {
+      const r = await window.storage.get(LOCAL_USER_KEY, false);
+      return r ? JSON.parse(r.value) : null;
+    } catch { return null; }
+  },
+  async setLocalUser(u) {
+    try { await window.storage.set(LOCAL_USER_KEY, JSON.stringify(u), false); return true; }
+    catch { return false; }
+  },
+};
+
+// ============================================================
+//  THEME: inject fonts + global CSS
+// ============================================================
+
+const THEME_CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;500;600;700&family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+  --bg-obsidian: #0b0d14;
+  --bg-deep: #111420;
+  --bg-panel: #181c2a;
+  --bg-panel-2: #1f2435;
+  --bg-elev: #262b3e;
+  --border-subtle: #2a2f44;
+  --border-strong: #3a4060;
+  --gold: #d4a437;
+  --gold-muted: #9b7a2a;
+  --gold-bright: #f0c451;
+  --ink: #e8e3d4;
+  --ink-dim: #a8a291;
+  --ink-faint: #6f6a5a;
+  --blood: #b94a4a;
+  --emerald: #7aa855;
+  --azure: #4a87a8;
+  --shadow-deep: 0 20px 60px -20px rgba(0,0,0,0.8), 0 8px 24px -8px rgba(0,0,0,0.5);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  font-family: 'EB Garamond', Georgia, serif;
+  background: var(--bg-obsidian);
+  color: var(--ink);
+  overflow: hidden;
+}
+
+.vtt-root {
+  width: 100vw; height: 100vh;
+  background:
+    radial-gradient(ellipse at top left, rgba(212,164,55,0.04), transparent 50%),
+    radial-gradient(ellipse at bottom right, rgba(74,135,168,0.05), transparent 55%),
+    var(--bg-obsidian);
+  color: var(--ink);
+  font-family: 'EB Garamond', Georgia, serif;
+  overflow: hidden;
+  position: relative;
+}
+
+.vtt-root::before {
+  content: '';
+  position: absolute; inset: 0;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.8  0 0 0 0 0.65  0 0 0 0 0.2  0 0 0 0.04 0'/></filter><rect width='120' height='120' filter='url(%23n)'/></svg>");
+  pointer-events: none; opacity: 0.5; mix-blend-mode: overlay;
+  z-index: 0;
+}
+
+.font-display { font-family: 'Cinzel', serif; letter-spacing: 0.04em; }
+.font-body { font-family: 'EB Garamond', Georgia, serif; }
+.font-mono { font-family: 'JetBrains Mono', monospace; }
+
+/* scrollbars */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2a2f44; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #3a4060; }
+
+/* buttons */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 12px; border-radius: 4px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-subtle);
+  color: var(--ink); font-family: 'Cinzel', serif;
+  font-size: 11px; letter-spacing: 0.08em;
+  cursor: pointer; transition: all 0.15s;
+  text-transform: uppercase;
+}
+.btn:hover { background: var(--bg-panel-2); border-color: var(--gold-muted); color: var(--gold-bright); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-primary { background: linear-gradient(180deg, #d4a437, #9b7a2a); color: #1a1410; border-color: var(--gold-muted); font-weight: 600; }
+.btn-primary:hover { background: linear-gradient(180deg, #f0c451, #c49a34); color: #1a1410; }
+.btn-danger:hover { border-color: var(--blood); color: var(--blood); background: rgba(185,74,74,0.1); }
+.btn-icon { padding: 6px; }
+.btn-ghost { background: transparent; border-color: transparent; }
+.btn-ghost:hover { background: var(--bg-panel-2); }
+
+.input {
+  background: var(--bg-deep);
+  border: 1px solid var(--border-subtle);
+  color: var(--ink);
+  padding: 6px 10px; border-radius: 3px;
+  font-family: 'EB Garamond', serif; font-size: 14px;
+  outline: none; transition: border 0.15s;
+  width: 100%;
+}
+.input:focus { border-color: var(--gold-muted); }
+.input.mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+
+.label { font-family: 'Cinzel', serif; font-size: 10px; letter-spacing: 0.12em; color: var(--ink-dim); text-transform: uppercase; }
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  box-shadow: var(--shadow-deep);
+}
+
+.divider-gold {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--gold-muted), transparent);
+  margin: 8px 0;
+}
+
+.chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px; border-radius: 99px;
+  background: var(--bg-elev); color: var(--ink-dim);
+  font-size: 10px; font-family: 'Cinzel', serif;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  border: 1px solid var(--border-subtle);
+}
+.chip-active { background: rgba(212,164,55,0.15); color: var(--gold-bright); border-color: var(--gold-muted); }
+.chip-cond { background: rgba(185,74,74,0.15); color: #e89090; border-color: rgba(185,74,74,0.3); }
+
+.glow-gold { box-shadow: 0 0 16px rgba(212,164,55,0.35), 0 0 32px rgba(212,164,55,0.15); }
+
+.ornament::before, .ornament::after {
+  content: '✦';
+  color: var(--gold-muted);
+  margin: 0 10px;
+  font-size: 0.7em;
+  vertical-align: middle;
+}
+
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.anim-fade { animation: fadeIn 0.25s ease-out; }
+
+@keyframes pulse-gold { 0%, 100% { box-shadow: 0 0 0 0 rgba(212,164,55,0.5); } 50% { box-shadow: 0 0 0 8px rgba(212,164,55,0); } }
+.pulse-gold { animation: pulse-gold 2s infinite; }
+
+.token-shape { cursor: grab; transition: filter 0.15s; }
+.token-shape:hover { filter: drop-shadow(0 0 6px var(--gold-bright)); }
+.token-shape.dragging { cursor: grabbing; }
+.token-hidden { opacity: 0.45; }
+.token-current-turn { filter: drop-shadow(0 0 10px var(--gold-bright)) drop-shadow(0 0 20px rgba(212,164,55,0.5)); }
+
+.map-svg { background: #0a0c12; cursor: grab; }
+.map-svg.panning { cursor: grabbing; }
+.map-svg.drop-target { outline: 2px dashed var(--gold-muted); outline-offset: -8px; }
+
+.scrollable { overflow-y: auto; overflow-x: hidden; }
+
+.entity-row { transition: background 0.12s, border-color 0.12s; }
+.entity-row:hover { background: var(--bg-panel-2); }
+.entity-row.selected { background: rgba(212,164,55,0.08); border-color: var(--gold-muted); }
+.entity-row.dragging-source { opacity: 0.5; }
+
+.banner-forced {
+  background: linear-gradient(180deg, rgba(185,74,74,0.2), rgba(185,74,74,0.05));
+  border-bottom: 1px solid var(--blood);
+  color: #f0c8c8;
+}
+
+.tooltip-parent { position: relative; }
+.tooltip-parent:hover .tooltip-text { opacity: 1; pointer-events: auto; transform: translateY(0); }
+.tooltip-text {
+  position: absolute; top: calc(100% + 6px); left: 50%; transform: translate(-50%, -4px);
+  background: var(--bg-obsidian); color: var(--ink); border: 1px solid var(--gold-muted);
+  font-family: 'Cinzel', serif; font-size: 10px; letter-spacing: 0.1em;
+  padding: 4px 8px; border-radius: 3px; white-space: nowrap;
+  opacity: 0; pointer-events: none; transition: opacity 0.15s, transform 0.15s;
+  text-transform: uppercase; z-index: 100;
+}
+
+select.input {
+  appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6'><path d='M0 0l5 6 5-6z' fill='%23a8a291'/></svg>");
+  background-repeat: no-repeat; background-position: right 10px center;
+  padding-right: 26px;
+}
+
+textarea.input { resize: vertical; min-height: 60px; font-family: 'EB Garamond', serif; }
+
+/* modal */
+.modal-bg {
+  position: fixed; inset: 0;
+  background: rgba(5,6,10,0.8);
+  backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 1000;
+}
+.modal-body {
+  background: var(--bg-panel);
+  border: 1px solid var(--gold-muted);
+  border-radius: 6px;
+  box-shadow: var(--shadow-deep), 0 0 40px rgba(212,164,55,0.15);
+  max-width: 90vw; max-height: 90vh; overflow: auto;
+}
+
+.tab-btn {
+  padding: 6px 14px; border: none; background: transparent; color: var(--ink-dim);
+  font-family: 'Cinzel', serif; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+  cursor: pointer; border-bottom: 2px solid transparent;
+}
+.tab-btn.active { color: var(--gold-bright); border-bottom-color: var(--gold); }
+.tab-btn:hover { color: var(--ink); }
+
+/* stat block */
+.stat-cell {
+  background: var(--bg-deep); border: 1px solid var(--border-subtle);
+  border-radius: 3px; padding: 4px 6px; text-align: center;
+}
+.stat-cell .label-s { font-family: 'Cinzel', serif; font-size: 9px; color: var(--ink-dim); letter-spacing: 0.1em; }
+.stat-cell .val { font-family: 'JetBrains Mono', monospace; font-size: 14px; color: var(--ink); font-weight: 500; }
+.stat-cell .modv { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--gold); }
+
+@media (max-width: 768px) {
+  .hide-mobile { display: none !important; }
+}
+`;
+
+function ThemeStyles() {
+  return <style dangerouslySetInnerHTML={{ __html: THEME_CSS }} />;
+}
+
+// ============================================================
+//  MAIN APP
+// ============================================================
+
+export default function App() {
+  const [booted, setBooted] = useState(false);
+  const [mode, setMode] = useState('login'); // login | dm | player
+  const [playerName, setPlayerName] = useState('');
+  const [session, setSession] = useState(null);
+  const [syncStatus, setSyncStatus] = useState('online'); // online | offline | syncing
+  const [lastSyncedVersion, setLastSyncedVersion] = useState(-1);
+  const sessionRef = useRef(null);
+  const writeTimer = useRef(null);
+
+  // ------ boot: load stored session + local user ------
+  useEffect(() => {
+    (async () => {
+      let s = await storage.getSession();
+      if (!s) {
+        s = createDefaultSession();
+        await storage.setSession(s);
+      }
+      sessionRef.current = s;
+      setSession(s);
+      setLastSyncedVersion(s.version);
+
+      const localUser = await storage.getLocalUser();
+      if (localUser) {
+        if (localUser.mode === 'dm') setMode('dm');
+        else if (localUser.mode === 'player') {
+          setPlayerName(localUser.name || '');
+          setMode('player');
+        }
+      }
+
+      // initialize DM password if unset
+      const pass = await storage.getDMPass();
+      if (!pass) await storage.setDMPass(DEFAULT_DM_PASSWORD);
+
+      setBooted(true);
+    })();
+  }, []);
+
+  // ------ DM: persist session on change (debounced) ------
+  const persistSession = useCallback((next) => {
+    sessionRef.current = next;
+    setSession(next);
+    if (mode !== 'dm') return;
+    if (writeTimer.current) clearTimeout(writeTimer.current);
+    setSyncStatus('syncing');
+    writeTimer.current = setTimeout(async () => {
+      const toWrite = { ...next, version: (next.version || 0) + 1, updatedAt: Date.now(), updatedBy: 'dm' };
+      sessionRef.current = toWrite;
+      setSession(toWrite);
+      const ok = await storage.setSession(toWrite);
+      setSyncStatus(ok ? 'online' : 'offline');
+      setLastSyncedVersion(toWrite.version);
+    }, 250);
+  }, [mode]);
+
+  // ------ Player: poll for updates ------
+  useEffect(() => {
+    if (mode !== 'player') return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const s = await storage.getSession();
+        if (cancelled) return;
+        if (s && s.version !== sessionRef.current?.version) {
+          sessionRef.current = s;
+          setSession(s);
+          setLastSyncedVersion(s.version);
+        }
+        setSyncStatus('online');
+      } catch {
+        setSyncStatus('offline');
+      }
+    };
+    poll();
+    const iv = setInterval(poll, 1500);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [mode]);
+
+  // ------ DM: poll for player writes (PC moves, claims, creation) ------
+  useEffect(() => {
+    if (mode !== 'dm') return;
+    let cancelled = false;
+    const poll = async () => {
+      // Skip if we have a pending write — don't clobber our own in-flight changes
+      if (writeTimer.current) return;
+      try {
+        const s = await storage.getSession();
+        if (cancelled) return;
+        if (s && s.version > (sessionRef.current?.version || 0) && s.updatedBy && s.updatedBy.startsWith('player:')) {
+          sessionRef.current = s;
+          setSession(s);
+          setLastSyncedVersion(s.version);
+        }
+        setSyncStatus('online');
+      } catch {
+        setSyncStatus('offline');
+      }
+    };
+    const iv = setInterval(poll, 2000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [mode]);
+
+  // ------ login handlers ------
+  const handleLogin = async (role, name, password) => {
+    if (role === 'dm') {
+      const stored = await storage.getDMPass();
+      if (password !== stored) return 'Incorrect passphrase.';
+      await storage.setLocalUser({ mode: 'dm' });
+      setMode('dm');
+      return null;
+    } else {
+      if (!name.trim()) return 'Enter a player name.';
+      await storage.setLocalUser({ mode: 'player', name: name.trim() });
+      setPlayerName(name.trim());
+      setMode('player');
+      return null;
+    }
+  };
+
+  const handleLogout = async () => {
+    await storage.setLocalUser(null);
+    setMode('login');
+    setPlayerName('');
+  };
+
+  if (!booted || !session) {
+    return (
+      <div className="vtt-root" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <ThemeStyles />
+        <div className="font-display" style={{ color: 'var(--gold)', letterSpacing: '0.2em', fontSize: 14 }}>
+          <span className="ornament">KINDLING THE HEARTH</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="vtt-root">
+      <ThemeStyles />
+      {mode === 'login' && <LoginScreen onLogin={handleLogin} />}
+      {mode === 'dm' && (
+        <DMInterface
+          session={session}
+          updateSession={persistSession}
+          onLogout={handleLogout}
+          syncStatus={syncStatus}
+        />
+      )}
+      {mode === 'player' && (
+        <PlayerInterface
+          session={session}
+          playerName={playerName}
+          onLogout={handleLogout}
+          syncStatus={syncStatus}
+          onMoveOwnToken={async (tokenId, x, y) => {
+            // Players can only move their claimed PC's token
+            const next = { ...session, tokens: session.tokens.map(t => t.id === tokenId ? { ...t, x, y } : t) };
+            // write directly (player write)
+            const toWrite = { ...next, version: (next.version || 0) + 1, updatedAt: Date.now(), updatedBy: `player:${playerName}` };
+            sessionRef.current = toWrite;
+            setSession(toWrite);
+            await storage.setSession(toWrite);
+          }}
+          onClaimPC={async (entityId) => {
+            const claims = { ...(session.claims || {}) };
+            // unclaim if already claimed by this player
+            Object.keys(claims).forEach(k => { if (claims[k] === entityId) delete claims[k]; });
+            claims[playerName] = entityId;
+            const next = { ...session, claims };
+            const toWrite = { ...next, version: (next.version || 0) + 1, updatedAt: Date.now(), updatedBy: `player:${playerName}` };
+            sessionRef.current = toWrite;
+            setSession(toWrite);
+            await storage.setSession(toWrite);
+          }}
+          onUnclaimPC={async () => {
+            const claims = { ...(session.claims || {}) };
+            delete claims[playerName];
+            const next = { ...session, claims };
+            const toWrite = { ...next, version: (next.version || 0) + 1, updatedAt: Date.now(), updatedBy: `player:${playerName}` };
+            sessionRef.current = toWrite;
+            setSession(toWrite);
+            await storage.setSession(toWrite);
+          }}
+          onCreatePC={async (pc) => {
+            const entity = {
+              id: uid(), type: 'pc', name: pc.name || 'Adventurer',
+              color: pc.color || ENTITY_COLORS[0],
+              ac: pc.ac ?? 12, hp: pc.hp ?? 10, maxHp: pc.maxHp ?? 10,
+              speed: 30, initBonus: 0, passivePerception: 10,
+              conditions: [], notes: '',
+              stats: { ...DEFAULT_STATS },
+              class: pc.class || 'Adventurer', level: pc.level || 1, playerName
+            };
+            const claims = { ...(session.claims || {}), [playerName]: entity.id };
+            const next = { ...session, entities: [...session.entities, entity], claims };
+            const toWrite = { ...next, version: (next.version || 0) + 1, updatedAt: Date.now(), updatedBy: `player:${playerName}` };
+            sessionRef.current = toWrite;
+            setSession(toWrite);
+            await storage.setSession(toWrite);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+//  LOGIN SCREEN
+// ============================================================
+
+function LoginScreen({ onLogin }) {
+  const [role, setRole] = useState(null); // null | 'dm' | 'player'
+  const [password, setPassword] = useState('');
+  const [name, setName] = useState('');
+  const [error, setError] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async () => {
+    setError(null);
+    setSubmitting(true);
+    const err = await onLogin(role, name, password);
+    if (err) setError(err);
+    setSubmitting(false);
+  };
+
+  return (
+    <div style={{
+      position: 'absolute', inset: 0, display: 'flex',
+      alignItems: 'center', justifyContent: 'center', padding: 20,
+      zIndex: 1
+    }}>
+      <div style={{ width: '100%', maxWidth: 440 }} className="anim-fade">
+        {/* Emblem */}
+        <div style={{ textAlign: 'center', marginBottom: 32 }}>
+          <div style={{
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            width: 84, height: 84, borderRadius: '50%',
+            background: 'radial-gradient(circle, rgba(212,164,55,0.2), transparent 70%)',
+            border: '1px solid var(--gold-muted)',
+            marginBottom: 20
+          }}>
+            <Swords size={36} style={{ color: 'var(--gold-bright)' }} />
+          </div>
+          <div className="font-display" style={{
+            fontSize: 28, color: 'var(--gold-bright)',
+            letterSpacing: '0.25em', fontWeight: 600, marginBottom: 6
+          }}>
+            ARCANUM
+          </div>
+          <div className="font-display" style={{
+            fontSize: 11, color: 'var(--ink-dim)',
+            letterSpacing: '0.3em'
+          }}>
+            <span className="ornament">A VIRTUAL TABLETOP</span>
+          </div>
+        </div>
+
+        <div className="panel" style={{ padding: 32 }}>
+          {!role && (
+            <>
+              <div className="font-display" style={{
+                textAlign: 'center', fontSize: 12, color: 'var(--ink-dim)',
+                letterSpacing: '0.2em', marginBottom: 24
+              }}>
+                CHOOSE YOUR SEAT
+              </div>
+
+              <button
+                onClick={() => setRole('dm')}
+                style={{
+                  width: '100%', padding: '18px 20px', marginBottom: 12,
+                  background: 'linear-gradient(180deg, rgba(212,164,55,0.1), rgba(212,164,55,0.02))',
+                  border: '1px solid var(--gold-muted)',
+                  borderRadius: 4, cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', gap: 14,
+                  color: 'var(--ink)', textAlign: 'left',
+                  transition: 'all 0.2s'
+                }}
+                onMouseEnter={e => e.currentTarget.style.background = 'linear-gradient(180deg, rgba(212,164,55,0.18), rgba(212,164,55,0.05))'}
+                onMouseLeave={e => e.currentTarget.style.background = 'linear-gradient(180deg, rgba(212,164,55,0.1), rgba(212,164,55,0.02))'}
+              >
+                <Crown size={28} style={{ color: 'var(--gold-bright)', flexShrink: 0 }} />
+                <div style={{ flex: 1 }}>
+                  <div className="font-display" style={{ fontSize: 14, color: 'var(--gold-bright)', letterSpacing: '0.15em', marginBottom: 4 }}>
+                    DUNGEON MASTER
+                  </div>
+                  <div style={{ fontSize: 13, color: 'var(--ink-dim)', lineHeight: 1.4 }}>
+                    Weave the tale. Command maps, entities, and fate itself.
+                  </div>
+                </div>
+                <ChevronRight size={18} style={{ color: 'var(--gold-muted)' }} />
+              </button>
+
+              <button
+                onClick={() => setRole('player')}
+                style={{
+                  width: '100%', padding: '18px 20px',
+                  background: 'var(--bg-elev)',
+                  border: '1px solid var(--border-strong)',
+                  borderRadius: 4, cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', gap: 14,
+                  color: 'var(--ink)', textAlign: 'left',
+                  transition: 'all 0.2s'
+                }}
+                onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--gold-muted)'; e.currentTarget.style.background = 'var(--bg-panel-2)'; }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border-strong)'; e.currentTarget.style.background = 'var(--bg-elev)'; }}
+              >
+                <Shield size={28} style={{ color: 'var(--azure)', flexShrink: 0 }} />
+                <div style={{ flex: 1 }}>
+                  <div className="font-display" style={{ fontSize: 14, color: 'var(--ink)', letterSpacing: '0.15em', marginBottom: 4 }}>
+                    ADVENTURER
+                  </div>
+                  <div style={{ fontSize: 13, color: 'var(--ink-dim)', lineHeight: 1.4 }}>
+                    Take up sword and spell. Join the party.
+                  </div>
+                </div>
+                <ChevronRight size={18} style={{ color: 'var(--border-strong)' }} />
+              </button>
+
+              <div className="divider-gold" style={{ marginTop: 24, marginBottom: 16 }} />
+              <div style={{ fontSize: 11, color: 'var(--ink-faint)', textAlign: 'center', fontStyle: 'italic' }}>
+                Local play uses a shared passphrase. Production deployments should pair this with proper authentication.
+              </div>
+            </>
+          )}
+
+          {role === 'dm' && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20 }}>
+                <button className="btn btn-ghost btn-icon" onClick={() => { setRole(null); setError(null); }}>
+                  <ChevronLeft size={14} />
+                </button>
+                <div className="font-display" style={{ fontSize: 14, color: 'var(--gold-bright)', letterSpacing: '0.2em' }}>
+                  THE DM'S SEAT
+                </div>
+              </div>
+              <div className="label" style={{ marginBottom: 6 }}>Passphrase</div>
+              <input
+                type="password" autoFocus
+                className="input"
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && submit()}
+                placeholder="Speak the word…"
+              />
+              <div style={{ fontSize: 11, color: 'var(--ink-faint)', marginTop: 6, fontStyle: 'italic' }}>
+                Default passphrase: <span className="font-mono" style={{ color: 'var(--gold)' }}>dmpass</span> (change it in Settings once inside)
+              </div>
+              {error && (
+                <div style={{ marginTop: 12, padding: '8px 12px', background: 'rgba(185,74,74,0.12)', border: '1px solid var(--blood)', borderRadius: 3, fontSize: 13, color: '#e89090' }}>
+                  {error}
+                </div>
+              )}
+              <button className="btn btn-primary" style={{ width: '100%', marginTop: 20, padding: '10px 12px', fontSize: 12 }} onClick={submit} disabled={submitting}>
+                <Lock size={12} /> {submitting ? 'OPENING THE GATE…' : 'ENTER THE SANCTUM'}
+              </button>
+            </>
+          )}
+
+          {role === 'player' && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20 }}>
+                <button className="btn btn-ghost btn-icon" onClick={() => { setRole(null); setError(null); }}>
+                  <ChevronLeft size={14} />
+                </button>
+                <div className="font-display" style={{ fontSize: 14, color: 'var(--ink)', letterSpacing: '0.2em' }}>
+                  A NEW ADVENTURER
+                </div>
+              </div>
+              <div className="label" style={{ marginBottom: 6 }}>Traveler's Name</div>
+              <input
+                autoFocus
+                className="input"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && submit()}
+                placeholder="Who do you claim to be?"
+                maxLength={32}
+              />
+              <div style={{ fontSize: 11, color: 'var(--ink-faint)', marginTop: 6, fontStyle: 'italic' }}>
+                This identifies you at the table. You can claim or create a character once inside.
+              </div>
+              {error && (
+                <div style={{ marginTop: 12, padding: '8px 12px', background: 'rgba(185,74,74,0.12)', border: '1px solid var(--blood)', borderRadius: 3, fontSize: 13, color: '#e89090' }}>
+                  {error}
+                </div>
+              )}
+              <button className="btn btn-primary" style={{ width: '100%', marginTop: 20, padding: '10px 12px', fontSize: 12 }} onClick={submit} disabled={submitting}>
+                <UserCheck size={12} /> {submitting ? 'MUSTERING…' : 'TAKE YOUR SEAT'}
+              </button>
+            </>
+          )}
+        </div>
+
+        <div style={{ textAlign: 'center', marginTop: 16, fontSize: 11, color: 'var(--ink-faint)', letterSpacing: '0.1em' }}>
+          <span style={{ color: 'var(--gold-muted)' }}>✦</span> Session persists across reloads <span style={{ color: 'var(--gold-muted)' }}>✦</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+//  MAP CANVAS (SVG-based, pan/zoom, tokens)
+// ============================================================
+
+function MapCanvas({
+  session, map, role, playerName,
+  onTokenMove, onTokenClick, onTokenContext,
+  onCanvasDrop, selectedTokenId, draggedEntityId,
+}) {
+  const svgRef = useRef(null);
+  const [viewport, setViewport] = useState(() => map?.viewport || { x: 0, y: 0, w: 1200, h: 800 });
+  const [isPanning, setIsPanning] = useState(false);
+  const panStart = useRef(null);
+  const [draggingToken, setDraggingToken] = useState(null); // { id, offsetX, offsetY }
+  const [isDragOver, setIsDragOver] = useState(false);
+
+  // reset viewport when map changes
+  useEffect(() => {
+    if (map?.viewport) setViewport(map.viewport);
+    else setViewport({ x: 0, y: 0, w: 1200, h: 800 });
+  }, [map?.id]);
+
+  const isDM = role === 'dm';
+
+  // tokens for this map, filtered by visibility for players
+  const visibleTokens = useMemo(() => {
+    if (!map) return [];
+    const here = session.tokens.filter(t => t.mapId === map.id);
+    if (isDM) return here;
+    // Player: see visible tokens + all PCs (if setting enabled)
+    return here.filter(tok => {
+      if (tok.visible) return true;
+      const ent = session.entities.find(e => e.id === tok.entityId);
+      if (ent?.type === 'pc' && session.settings?.showAllPCsToPlayers) return true;
+      return false;
+    });
+  }, [session, map, isDM]);
+
+  // claimed token for this player
+  const claimedEntityId = !isDM && playerName ? session.claims?.[playerName] : null;
+
+  const screenToSvg = (clientX, clientY) => {
+    const svg = svgRef.current;
+    if (!svg) return { x: 0, y: 0 };
+    const r = svg.getBoundingClientRect();
+    const px = (clientX - r.left) / r.width;
+    const py = (clientY - r.top) / r.height;
+    return {
+      x: viewport.x + px * viewport.w,
+      y: viewport.y + py * viewport.h
+    };
+  };
+
+  // pan via middle/right button OR left button on empty space
+  const onMouseDown = (e) => {
+    if (draggingToken) return;
+    if (e.target.dataset?.token || e.target.closest?.('[data-token]')) return;
+    setIsPanning(true);
+    panStart.current = { x: e.clientX, y: e.clientY, vx: viewport.x, vy: viewport.y };
+    e.preventDefault();
+  };
+
+  const onMouseMove = (e) => {
+    if (draggingToken) {
+      const p = screenToSvg(e.clientX, e.clientY);
+      const nx = Math.round(p.x - draggingToken.offsetX);
+      const ny = Math.round(p.y - draggingToken.offsetY);
+      // temp visual: update local session via callback is expensive; we set local only
+      setDraggingToken({ ...draggingToken, ghostX: nx, ghostY: ny });
+      return;
+    }
+    if (isPanning && panStart.current) {
+      const svg = svgRef.current;
+      const r = svg.getBoundingClientRect();
+      const dx = (panStart.current.x - e.clientX) / r.width * viewport.w;
+      const dy = (panStart.current.y - e.clientY) / r.height * viewport.h;
+      setViewport(v => ({ ...v, x: panStart.current.vx + dx, y: panStart.current.vy + dy }));
+    }
+  };
+
+  const onMouseUp = (e) => {
+    if (draggingToken) {
+      if (draggingToken.ghostX !== undefined) {
+        onTokenMove(draggingToken.id, draggingToken.ghostX, draggingToken.ghostY);
+      }
+      setDraggingToken(null);
+    }
+    setIsPanning(false);
+    panStart.current = null;
+  };
+
+  const onWheel = (e) => {
+    e.preventDefault();
+    const svg = svgRef.current;
+    const r = svg.getBoundingClientRect();
+    const px = (e.clientX - r.left) / r.width;
+    const py = (e.clientY - r.top) / r.height;
+    const worldX = viewport.x + px * viewport.w;
+    const worldY = viewport.y + py * viewport.h;
+    const factor = e.deltaY > 0 ? 1.12 : 1 / 1.12;
+    const newW = Math.max(200, Math.min(6000, viewport.w * factor));
+    const newH = viewport.h * (newW / viewport.w);
+    setViewport({
+      x: worldX - px * newW,
+      y: worldY - py * newH,
+      w: newW, h: newH
+    });
+  };
+
+  const startTokenDrag = (e, token) => {
+    // Players: only their claimed PC
+    if (!isDM) {
+      if (token.entityId !== claimedEntityId) return;
+    }
+    e.stopPropagation();
+    const p = screenToSvg(e.clientX, e.clientY);
+    setDraggingToken({
+      id: token.id,
+      offsetX: p.x - token.x,
+      offsetY: p.y - token.y,
+      ghostX: token.x, ghostY: token.y
+    });
+  };
+
+  const zoomIn = () => setViewport(v => ({ ...v, w: v.w / 1.25, h: v.h / 1.25, x: v.x + v.w * 0.1, y: v.y + v.h * 0.1 }));
+  const zoomOut = () => setViewport(v => ({ ...v, w: v.w * 1.25, h: v.h * 1.25, x: v.x - v.w * 0.125, y: v.y - v.h * 0.125 }));
+  const resetView = () => setViewport({ x: 0, y: 0, w: 1200, h: 800 });
+
+  // drag-drop from sidebar
+  const onDragOverCanvas = (e) => {
+    if (!isDM) return;
+    e.preventDefault();
+    setIsDragOver(true);
+  };
+  const onDragLeaveCanvas = () => setIsDragOver(false);
+  const onDropCanvas = (e) => {
+    if (!isDM) return;
+    e.preventDefault();
+    setIsDragOver(false);
+    const entityId = e.dataTransfer.getData('entity-id');
+    if (!entityId) return;
+    const p = screenToSvg(e.clientX, e.clientY);
+    onCanvasDrop(entityId, Math.round(p.x), Math.round(p.y));
+  };
+
+  if (!map) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--ink-faint)' }}>
+        <div className="font-display" style={{ letterSpacing: '0.2em' }}><span className="ornament">NO MAP</span></div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
+      <svg
+        ref={svgRef}
+        className={`map-svg ${isPanning ? 'panning' : ''} ${isDragOver ? 'drop-target' : ''}`}
+        viewBox={`${viewport.x} ${viewport.y} ${viewport.w} ${viewport.h}`}
+        preserveAspectRatio="xMidYMid meet"
+        style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none', userSelect: 'none' }}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onMouseUp={onMouseUp}
+        onMouseLeave={onMouseUp}
+        onWheel={onWheel}
+        onDragOver={onDragOverCanvas}
+        onDragLeave={onDragLeaveCanvas}
+        onDrop={onDropCanvas}
+      >
+        {/* map background */}
+        <defs>
+          <pattern id="grid" width="60" height="60" patternUnits="userSpaceOnUse">
+            <path d="M 60 0 L 0 0 0 60" fill="none" stroke="#1c2030" strokeWidth="1"/>
+          </pattern>
+          <radialGradient id="mapVignette" cx="50%" cy="50%" r="70%">
+            <stop offset="70%" stopColor="rgba(0,0,0,0)" />
+            <stop offset="100%" stopColor="rgba(0,0,0,0.5)" />
+          </radialGradient>
+          <filter id="tokenGlow">
+            <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+            <feMerge>
+              <feMergeNode in="coloredBlur"/>
+              <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+          </filter>
+        </defs>
+
+        {map.imageUrl ? (
+          <image href={map.imageUrl} x="0" y="0" width="1200" height="800" preserveAspectRatio="xMidYMid slice" />
+        ) : (
+          <rect x="-4000" y="-4000" width="8000" height="8000" fill="#0f1220" />
+        )}
+        <rect x="-4000" y="-4000" width="8000" height="8000" fill="url(#grid)" />
+
+        {/* Map label (faded) */}
+        <text
+          x={viewport.x + 20} y={viewport.y + 40}
+          fill="#2a2f44" fontFamily="Cinzel, serif"
+          fontSize={Math.max(24, viewport.w / 40)}
+          letterSpacing="0.15em"
+          style={{ pointerEvents: 'none' }}
+        >
+          {map.name.toUpperCase()}
+        </text>
+
+        {/* Tokens */}
+        {visibleTokens.map(tok => {
+          const ent = session.entities.find(e => e.id === tok.entityId);
+          if (!ent) return null;
+          const isDragging = draggingToken?.id === tok.id;
+          const x = isDragging && draggingToken.ghostX !== undefined ? draggingToken.ghostX : tok.x;
+          const y = isDragging && draggingToken.ghostY !== undefined ? draggingToken.ghostY : tok.y;
+          const size = 28;
+          const isCurrentTurn = session.initiative.active &&
+            session.initiative.entries[session.initiative.turnIndex]?.entityId === ent.id;
+          const canDrag = isDM || (ent.id === claimedEntityId);
+          const isHiddenFromPlayers = !tok.visible;
+          const isDead = (ent.hp ?? 1) <= 0;
+          const selected = selectedTokenId === tok.id;
+          return (
+            <g
+              key={tok.id}
+              transform={`translate(${x}, ${y})`}
+              data-token="true"
+              className={`token-shape ${isHiddenFromPlayers && isDM ? 'token-hidden' : ''} ${isCurrentTurn ? 'token-current-turn' : ''} ${isDragging ? 'dragging' : ''}`}
+              style={{ cursor: canDrag ? 'grab' : 'pointer' }}
+              onMouseDown={(e) => { if (canDrag && e.button === 0) startTokenDrag(e, tok); }}
+              onClick={(e) => { e.stopPropagation(); onTokenClick(tok, ent); }}
+              onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); if (isDM) onTokenContext(tok, ent); }}
+            >
+              {/* selection ring */}
+              {selected && (
+                <circle r={size + 4} fill="none" stroke="var(--gold-bright)" strokeWidth="1.5" strokeDasharray="4 4">
+                  <animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="20s" repeatCount="indefinite" />
+                </circle>
+              )}
+              {/* shape */}
+              {ent.type === 'pc' && (
+                <circle r={size} fill={ent.color} stroke="#0b0d14" strokeWidth="3" />
+              )}
+              {ent.type === 'monster' && (
+                <polygon
+                  points={`0,${-size} ${size},0 0,${size} ${-size},0`}
+                  fill={ent.color} stroke="#0b0d14" strokeWidth="3"
+                />
+              )}
+              {ent.type === 'npc' && (
+                <rect x={-size} y={-size} width={size*2} height={size*2} fill={ent.color} stroke="#0b0d14" strokeWidth="3" rx="4"/>
+              )}
+              {/* inner */}
+              <circle r={size * 0.55} fill="#0b0d14" opacity="0.4" />
+              <text
+                textAnchor="middle" dominantBaseline="central"
+                fill="#fff" fontFamily="Cinzel, serif"
+                fontSize={size * 0.85} fontWeight="700"
+                style={{ pointerEvents: 'none', userSelect: 'none' }}
+              >
+                {ent.name.charAt(0).toUpperCase()}
+              </text>
+              {/* hidden marker (DM only) */}
+              {isDM && isHiddenFromPlayers && (
+                <g transform={`translate(${size*0.7}, ${-size*0.7})`} style={{ pointerEvents: 'none' }}>
+                  <circle r="10" fill="#0b0d14" stroke="var(--gold-muted)" strokeWidth="1"/>
+                  <g transform="translate(-6,-6) scale(0.5)">
+                    <path d="M12 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0z" fill="var(--gold)"/>
+                    <path d="M21 12c-2.7 4.5-6 7-9 7s-6.3-2.5-9-7c2.7-4.5 6-7 9-7s6.3 2.5 9 7z" fill="none" stroke="var(--gold)" strokeWidth="2"/>
+                    <line x1="3" y1="3" x2="21" y2="21" stroke="var(--blood)" strokeWidth="2.5"/>
+                  </g>
+                </g>
+              )}
+              {/* name label */}
+              <text
+                y={size + 16} textAnchor="middle"
+                fill="var(--ink)" fontFamily="Cinzel, serif"
+                fontSize="11" letterSpacing="0.08em"
+                style={{ pointerEvents: 'none', userSelect: 'none' }}
+              >
+                {ent.name.toUpperCase()}
+              </text>
+              {/* HP bar (DM view) */}
+              {isDM && ent.maxHp > 0 && (
+                <g transform={`translate(${-size}, ${-size - 12})`} style={{ pointerEvents: 'none' }}>
+                  <rect width={size*2} height="4" fill="#0b0d14" stroke="var(--border-strong)" strokeWidth="0.5" rx="1"/>
+                  <rect width={(size*2) * Math.max(0, Math.min(1, ent.hp / ent.maxHp))} height="4" fill={ent.hp / ent.maxHp > 0.5 ? 'var(--emerald)' : ent.hp / ent.maxHp > 0.25 ? '#d97706' : 'var(--blood)'} rx="1"/>
+                </g>
+              )}
+              {/* dead marker */}
+              {isDead && (
+                <line x1={-size} y1={-size} x2={size} y2={size} stroke="var(--blood)" strokeWidth="3" style={{ pointerEvents: 'none' }}/>
+              )}
+            </g>
+          );
+        })}
+
+        <rect x={viewport.x} y={viewport.y} width={viewport.w} height={viewport.h} fill="url(#mapVignette)" style={{ pointerEvents: 'none' }}/>
+      </svg>
+
+      {/* Zoom controls */}
+      <div style={{
+        position: 'absolute', bottom: 16, right: 16,
+        display: 'flex', flexDirection: 'column', gap: 4,
+        background: 'rgba(11,13,20,0.9)', border: '1px solid var(--border-subtle)',
+        borderRadius: 6, padding: 4, backdropFilter: 'blur(4px)'
+      }}>
+        <button className="btn btn-icon btn-ghost tooltip-parent" onClick={zoomIn}><ZoomIn size={14}/><span className="tooltip-text">Zoom In</span></button>
+        <button className="btn btn-icon btn-ghost tooltip-parent" onClick={zoomOut}><ZoomOut size={14}/><span className="tooltip-text">Zoom Out</span></button>
+        <button className="btn btn-icon btn-ghost tooltip-parent" onClick={resetView}><RotateCcw size={14}/><span className="tooltip-text">Reset View</span></button>
+      </div>
+
+      {/* Zoom / pan hint */}
+      <div style={{
+        position: 'absolute', bottom: 16, left: 16,
+        fontSize: 10, color: 'var(--ink-faint)',
+        fontFamily: 'Cinzel, serif', letterSpacing: '0.1em',
+        background: 'rgba(11,13,20,0.7)', padding: '4px 8px', borderRadius: 3
+      }}>
+        SCROLL TO ZOOM · DRAG TO PAN
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+//  DM INTERFACE
+// ============================================================
+
+function DMInterface({ session, updateSession, onLogout, syncStatus }) {
+  const [selectedEntityId, setSelectedEntityId] = useState(null);
+  const [selectedTokenId, setSelectedTokenId] = useState(null);
+  const [showInitiative, setShowInitiative] = useState(false);
+  const [showMapManager, setShowMapManager] = useState(false);
+  const [showPresets, setShowPresets] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [tokenDetail, setTokenDetail] = useState(null); // { token, entity }
+  const [entityEditor, setEntityEditor] = useState(null); // { entity, isNew }
+  const [searchQ, setSearchQ] = useState('');
+  const [typeFilter, setTypeFilter] = useState('all');
+  const [aliveFilter, setAliveFilter] = useState('all'); // all | alive | dead
+  const [draggedEntityId, setDraggedEntityId] = useState(null);
+
+  const currentMap = session.maps.find(m => m.id === session.currentMapId);
+
+  // ---- derived ----
+  const filteredEntities = useMemo(() => {
+    return session.entities.filter(e => {
+      if (typeFilter !== 'all' && e.type !== typeFilter) return false;
+      if (aliveFilter === 'alive' && (e.hp ?? 1) <= 0) return false;
+      if (aliveFilter === 'dead' && (e.hp ?? 1) > 0) return false;
+      if (searchQ && !e.name.toLowerCase().includes(searchQ.toLowerCase())) return false;
+      return true;
+    });
+  }, [session.entities, searchQ, typeFilter, aliveFilter]);
+
+  // ---- handlers ----
+  const updateEntity = (id, patch) => {
+    updateSession({
+      ...session,
+      entities: session.entities.map(e => e.id === id ? { ...e, ...patch } : e)
+    });
+  };
+
+  const deleteEntity = (id) => {
+    if (!confirm('Remove this entity entirely (and all its tokens)?')) return;
+    updateSession({
+      ...session,
+      entities: session.entities.filter(e => e.id !== id),
+      tokens: session.tokens.filter(t => t.entityId !== id),
+      initiative: {
+        ...session.initiative,
+        entries: session.initiative.entries.filter(en => en.entityId !== id)
+      }
+    });
+    if (selectedEntityId === id) setSelectedEntityId(null);
+  };
+
+  const saveEntity = (entity, isNew) => {
+    if (isNew) {
+      updateSession({ ...session, entities: [...session.entities, entity] });
+    } else {
+      updateSession({ ...session, entities: session.entities.map(e => e.id === entity.id ? entity : e) });
+    }
+    setEntityEditor(null);
+  };
+
+  const dropEntityOnMap = (entityId, x, y) => {
+    // prevent duplicate placement on same map
+    if (session.tokens.find(t => t.entityId === entityId && t.mapId === currentMap.id)) {
+      alert('This entity already has a token on this map.');
+      return;
+    }
+    const newToken = { id: uid(), entityId, mapId: currentMap.id, x, y, visible: false };
+    updateSession({ ...session, tokens: [...session.tokens, newToken] });
+  };
+
+  const moveToken = (tokenId, x, y) => {
+    updateSession({
+      ...session,
+      tokens: session.tokens.map(t => t.id === tokenId ? { ...t, x, y } : t)
+    });
+  };
+
+  const toggleTokenVisibility = (tokenId) => {
+    updateSession({
+      ...session,
+      tokens: session.tokens.map(t => t.id === tokenId ? { ...t, visible: !t.visible } : t)
+    });
+  };
+
+  const removeToken = (tokenId) => {
+    updateSession({
+      ...session,
+      tokens: session.tokens.filter(t => t.id !== tokenId)
+    });
+    setSelectedTokenId(null);
+  };
+
+  const revealAllOnMap = () => {
+    updateSession({
+      ...session,
+      tokens: session.tokens.map(t => t.mapId === currentMap.id ? { ...t, visible: true } : t)
+    });
+  };
+  const hideAllOnMap = () => {
+    updateSession({
+      ...session,
+      tokens: session.tokens.map(t => t.mapId === currentMap.id ? { ...t, visible: false } : t)
+    });
+  };
+
+  const adjustHP = (entId, delta) => {
+    const ent = session.entities.find(e => e.id === entId);
+    if (!ent) return;
+    const nhp = Math.max(0, Math.min(ent.maxHp || 9999, (ent.hp ?? 0) + delta));
+    updateEntity(entId, { hp: nhp });
+  };
+
+  const toggleCondition = (entId, cond) => {
+    const ent = session.entities.find(e => e.id === entId);
+    if (!ent) return;
+    const has = ent.conditions?.includes(cond);
+    updateEntity(entId, {
+      conditions: has ? ent.conditions.filter(c => c !== cond) : [...(ent.conditions || []), cond]
+    });
+  };
+
+  const changeMap = (mapId) => {
+    updateSession({ ...session, currentMapId: mapId });
+    setSelectedTokenId(null);
+  };
+
+  const breadcrumb = useMemo(() => {
+    const chain = [];
+    let m = currentMap;
+    while (m) {
+      chain.unshift(m);
+      m = session.maps.find(x => x.id === m.parentId);
+    }
+    return chain;
+  }, [currentMap, session.maps]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', position: 'relative', zIndex: 1 }}>
+      {/* TOP BAR */}
+      <TopBar
+        role="dm"
+        title={`${currentMap?.name || 'No Map'}`}
+        subtitle="Dungeon Master"
+        syncStatus={syncStatus}
+        forcedView={session.forcedView}
+        actions={
+          <>
+            <button className="btn" onClick={() => setShowInitiative(!showInitiative)}>
+              <SwordsIcon size={12}/> Initiative
+              {session.initiative.active && <span className="chip chip-active" style={{ marginLeft: 4, padding: '0 6px', fontSize: 9 }}>LIVE</span>}
+            </button>
+            <button className="btn" onClick={() => setShowMapManager(!showMapManager)}>
+              <MapIcon size={12}/> Maps
+            </button>
+            <button className="btn" onClick={() => setShowPresets(!showPresets)}>
+              <Scroll size={12}/> Presets
+            </button>
+            <button
+              className={`btn ${session.forcedView ? 'btn-primary' : ''}`}
+              onClick={() => updateSession({ ...session, forcedView: session.forcedView ? null : { mapId: currentMap.id } })}
+              title={session.forcedView ? 'Release players' : 'Push this map to players'}
+            >
+              <Radio size={12}/> {session.forcedView ? 'RELEASE VIEW' : 'PUSH VIEW'}
+            </button>
+            <div style={{ width: 1, height: 20, background: 'var(--border-subtle)' }} />
+            <button className="btn btn-ghost btn-icon tooltip-parent" onClick={revealAllOnMap}>
+              <Eye size={14}/>
+              <span className="tooltip-text">Reveal all on map</span>
+            </button>
+            <button className="btn btn-ghost btn-icon tooltip-parent" onClick={hideAllOnMap}>
+              <EyeOff size={14}/>
+              <span className="tooltip-text">Hide all on map</span>
+            </button>
+            <button className="btn btn-ghost btn-icon tooltip-parent" onClick={() => setShowSettings(true)}>
+              <Settings size={14}/>
+              <span className="tooltip-text">Settings</span>
+            </button>
+            <button className="btn btn-ghost btn-icon tooltip-parent" onClick={onLogout}>
+              <LogOut size={14}/>
+              <span className="tooltip-text">Log out</span>
+            </button>
+          </>
+        }
+      />
+
+      {/* BREADCRUMB */}
+      <div style={{
+        padding: '6px 16px', display: 'flex', alignItems: 'center', gap: 8,
+        borderBottom: '1px solid var(--border-subtle)',
+        background: 'var(--bg-deep)', fontSize: 12
+      }}>
+        <Home size={12} style={{ color: 'var(--ink-faint)' }}/>
+        {breadcrumb.map((m, i) => (
+          <span key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button
+              onClick={() => changeMap(m.id)}
+              className="font-display"
+              style={{
+                background: 'none', border: 'none', cursor: 'pointer',
+                color: i === breadcrumb.length - 1 ? 'var(--gold-bright)' : 'var(--ink-dim)',
+                fontSize: 11, letterSpacing: '0.12em', textTransform: 'uppercase'
+              }}
+            >
+              {m.name}
+            </button>
+            {i < breadcrumb.length - 1 && <ChevronRight size={10} style={{ color: 'var(--ink-faint)' }}/>}
+          </span>
+        ))}
+        <div style={{ flex: 1 }} />
+        <span className="font-mono" style={{ fontSize: 10, color: 'var(--ink-faint)' }}>
+          {session.tokens.filter(t => t.mapId === currentMap?.id).length} TOKENS · {session.entities.length} ENTITIES
+        </span>
+      </div>
+
+      {/* MAIN LAYOUT */}
+      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+        {/* LEFT SIDEBAR */}
+        <aside style={{
+          width: 320, flexShrink: 0, display: 'flex', flexDirection: 'column',
+          borderRight: '1px solid var(--border-subtle)',
+          background: 'var(--bg-panel)'
+        }} className="hide-mobile">
+          <div style={{ padding: 12, borderBottom: '1px solid var(--border-subtle)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+              <div className="font-display" style={{ fontSize: 11, color: 'var(--gold-bright)', letterSpacing: '0.18em', flex: 1 }}>
+                DRAMATIS PERSONAE
+              </div>
+              <button
+                className="btn btn-primary"
+                style={{ padding: '3px 8px', fontSize: 10 }}
+                onClick={() => setEntityEditor({
+                  entity: {
+                    id: uid(), type: 'monster', name: 'New Entity',
+                    color: ENTITY_COLORS[Math.floor(Math.random() * ENTITY_COLORS.length)],
+                    ac: 12, hp: 10, maxHp: 10, speed: 30, initBonus: 0, passivePerception: 10,
+                    conditions: [], notes: '', stats: { ...DEFAULT_STATS }
+                  }, isNew: true
+                })}
+              >
+                <Plus size={10}/> NEW
+              </button>
+            </div>
+            <div style={{ position: 'relative', marginBottom: 8 }}>
+              <Search size={12} style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', color: 'var(--ink-faint)' }}/>
+              <input
+                className="input"
+                style={{ paddingLeft: 28, fontSize: 13 }}
+                placeholder="Search the roster…"
+                value={searchQ}
+                onChange={e => setSearchQ(e.target.value)}
+              />
+            </div>
+            <div style={{ display: 'flex', gap: 4 }}>
+              {['all', 'pc', 'monster', 'npc'].map(t => (
+                <button
+                  key={t}
+                  onClick={() => setTypeFilter(t)}
+                  className={`btn ${typeFilter === t ? 'btn-primary' : ''}`}
+                  style={{ padding: '3px 6px', fontSize: 9, flex: 1 }}
+                >
+                  {t.toUpperCase()}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+              {['all', 'alive', 'dead'].map(t => (
+                <button
+                  key={t}
+                  onClick={() => setAliveFilter(t)}
+                  className={`btn ${aliveFilter === t ? 'btn-primary' : ''}`}
+                  style={{ padding: '2px 4px', fontSize: 9, flex: 1 }}
+                >
+                  {t.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* entity list */}
+          <div className="scrollable" style={{ flex: 1, padding: 8 }}>
+            {filteredEntities.length === 0 && (
+              <div style={{ textAlign: 'center', padding: 30, color: 'var(--ink-faint)' }}>
+                <Gem size={22} style={{ opacity: 0.4, marginBottom: 8 }}/>
+                <div className="font-display" style={{ fontSize: 11, letterSpacing: '0.15em' }}>
+                  {session.entities.length === 0 ? 'NO ENTITIES YET' : 'NONE MATCH'}
+                </div>
+                <div style={{ fontSize: 12, marginTop: 4, fontStyle: 'italic' }}>
+                  {session.entities.length === 0 ? 'Forge heroes, foes, and folk.' : 'Try a different filter.'}
+                </div>
+              </div>
+            )}
+            {filteredEntities.map(ent => {
+              const hasToken = session.tokens.some(t => t.entityId === ent.id && t.mapId === currentMap?.id);
+              const dead = (ent.hp ?? 1) <= 0;
+              return (
+                <div
+                  key={ent.id}
+                  className={`entity-row ${selectedEntityId === ent.id ? 'selected' : ''} ${draggedEntityId === ent.id ? 'dragging-source' : ''}`}
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData('entity-id', ent.id);
+                    e.dataTransfer.effectAllowed = 'copy';
+                    setDraggedEntityId(ent.id);
+                  }}
+                  onDragEnd={() => setDraggedEntityId(null)}
+                  onClick={() => setSelectedEntityId(ent.id)}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 10,
+                    padding: '8px 10px', marginBottom: 4, borderRadius: 4,
+                    border: '1px solid var(--border-subtle)',
+                    cursor: 'grab'
+                  }}
+                >
+                  <EntityTypeIcon type={ent.type} color={ent.color} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div className="font-display" style={{
+                      fontSize: 12, letterSpacing: '0.08em',
+                      color: dead ? 'var(--ink-faint)' : 'var(--ink)',
+                      textDecoration: dead ? 'line-through' : 'none',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+                    }}>
+                      {ent.name}
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 10, color: 'var(--ink-dim)' }}>
+                      <span className="font-mono">HP <span style={{ color: dead ? 'var(--blood)' : ent.hp/ent.maxHp <= 0.5 ? '#d97706' : 'var(--emerald)' }}>{ent.hp}</span>/{ent.maxHp}</span>
+                      <span style={{ color: 'var(--ink-faint)' }}>·</span>
+                      <span className="font-mono">AC {ent.ac}</span>
+                      {ent.conditions?.length > 0 && (
+                        <>
+                          <span style={{ color: 'var(--ink-faint)' }}>·</span>
+                          <span style={{ color: '#e89090' }}>{ent.conditions.length} cond</span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 2 }} onClick={e => e.stopPropagation()}>
+                    <button className="btn btn-ghost btn-icon tooltip-parent" onClick={() => adjustHP(ent.id, -1)}>
+                      <Minus size={10}/>
+                    </button>
+                    <button className="btn btn-ghost btn-icon tooltip-parent" onClick={() => adjustHP(ent.id, 1)}>
+                      <Plus size={10}/>
+                    </button>
+                    <button className="btn btn-ghost btn-icon tooltip-parent" onClick={() => setEntityEditor({ entity: ent, isNew: false })}>
+                      <Edit3 size={10}/>
+                    </button>
+                  </div>
+                  {hasToken && (
+                    <div className="tooltip-parent" style={{ color: 'var(--gold)' }}>
+                      <MapIcon size={10}/>
+                      <span className="tooltip-text">On this map</span>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* hint */}
+          <div style={{
+            padding: '8px 12px', borderTop: '1px solid var(--border-subtle)',
+            background: 'var(--bg-deep)', fontSize: 10, color: 'var(--ink-faint)',
+            fontStyle: 'italic', textAlign: 'center'
+          }}>
+            <span style={{ color: 'var(--gold-muted)' }}>✦</span> Drag an entity onto the map to summon them <span style={{ color: 'var(--gold-muted)' }}>✦</span>
+          </div>
+        </aside>
+
+        {/* MAP CANVAS */}
+        <main style={{ flex: 1, position: 'relative', minWidth: 0 }}>
+          <MapCanvas
+            session={session}
+            map={currentMap}
+            role="dm"
+            onTokenMove={moveToken}
+            onTokenClick={(tok, ent) => {
+              setSelectedTokenId(tok.id);
+              setTokenDetail({ token: tok, entity: ent });
+            }}
+            onTokenContext={(tok) => removeToken(tok.id)}
+            onCanvasDrop={dropEntityOnMap}
+            selectedTokenId={selectedTokenId}
+            draggedEntityId={draggedEntityId}
+          />
+
+          {/* FLOATING PANELS */}
+          {showInitiative && (
+            <FloatingPanel title="Initiative" icon={<SwordsIcon size={14}/>} onClose={() => setShowInitiative(false)} style={{ top: 16, right: 16, width: 320 }}>
+              <InitiativePanel session={session} updateSession={updateSession} role="dm" />
+            </FloatingPanel>
+          )}
+          {showMapManager && (
+            <FloatingPanel title="Cartographer" icon={<MapIcon size={14}/>} onClose={() => setShowMapManager(false)} style={{ top: 16, right: showInitiative ? 348 : 16, width: 340 }}>
+              <MapManagerPanel session={session} updateSession={updateSession} changeMap={changeMap} />
+            </FloatingPanel>
+          )}
+          {showPresets && (
+            <FloatingPanel title="Encounter Scrolls" icon={<Scroll size={14}/>} onClose={() => setShowPresets(false)} style={{ bottom: 60, right: 16, width: 320 }}>
+              <PresetsPanel session={session} updateSession={updateSession} currentMap={currentMap} />
+            </FloatingPanel>
+          )}
+          {tokenDetail && (
+            <TokenDetailPanel
+              token={tokenDetail.token}
+              entity={tokenDetail.entity}
+              onClose={() => setTokenDetail(null)}
+              role="dm"
+              session={session}
+              updateEntity={updateEntity}
+              toggleVisibility={() => { toggleTokenVisibility(tokenDetail.token.id); setTokenDetail(null); }}
+              adjustHP={adjustHP}
+              toggleCondition={toggleCondition}
+              onRemoveToken={() => { removeToken(tokenDetail.token.id); setTokenDetail(null); }}
+            />
+          )}
+        </main>
+      </div>
+
+      {/* MODALS */}
+      {entityEditor && (
+        <EntityEditorModal
+          entity={entityEditor.entity}
+          isNew={entityEditor.isNew}
+          onSave={(e) => saveEntity(e, entityEditor.isNew)}
+          onDelete={!entityEditor.isNew ? () => { deleteEntity(entityEditor.entity.id); setEntityEditor(null); } : null}
+          onClose={() => setEntityEditor(null)}
+        />
+      )}
+      {showSettings && (
+        <SettingsModal session={session} updateSession={updateSession} onClose={() => setShowSettings(false)} />
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+//  SHARED UI COMPONENTS
+// ============================================================
+
+function TopBar({ title, subtitle, role, actions, syncStatus, forcedView }) {
+  return (
+    <>
+      {forcedView && (
+        <div className="banner-forced" style={{ padding: '6px 16px', display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+          <Radio size={12}/>
+          <span className="font-display" style={{ fontSize: 11, letterSpacing: '0.15em' }}>
+            DM-CONTROLLED VIEW ACTIVE — PLAYERS ARE LOCKED TO THIS MAP
+          </span>
+        </div>
+      )}
+      <header style={{
+        padding: '10px 16px',
+        borderBottom: '1px solid var(--border-subtle)',
+        background: 'linear-gradient(180deg, var(--bg-panel), var(--bg-deep))',
+        display: 'flex', alignItems: 'center', gap: 12,
+        flexShrink: 0,
+      }}>
+        <div style={{
+          width: 36, height: 36, borderRadius: '50%',
+          background: role === 'dm' ? 'radial-gradient(circle, rgba(212,164,55,0.25), transparent 70%)' : 'radial-gradient(circle, rgba(74,135,168,0.25), transparent 70%)',
+          border: `1px solid ${role === 'dm' ? 'var(--gold-muted)' : 'var(--azure)'}`,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          flexShrink: 0,
+        }}>
+          {role === 'dm' ? <Crown size={18} style={{ color: 'var(--gold-bright)' }}/> : <Shield size={18} style={{ color: 'var(--azure)' }}/>}
+        </div>
+        <div style={{ minWidth: 0 }}>
+          <div className="font-display" style={{
+            fontSize: 10, color: role === 'dm' ? 'var(--gold-bright)' : 'var(--azure)',
+            letterSpacing: '0.25em'
+          }}>
+            {subtitle?.toUpperCase()}
+          </div>
+          <div className="font-display" style={{
+            fontSize: 15, color: 'var(--ink)', letterSpacing: '0.1em',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+          }}>
+            {title}
+          </div>
+        </div>
+        <div style={{ flex: 1 }}/>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          {actions}
+        </div>
+        <div style={{ width: 1, height: 20, background: 'var(--border-subtle)' }} className="hide-mobile" />
+        <div className="tooltip-parent hide-mobile" style={{
+          display: 'flex', alignItems: 'center', gap: 4,
+          padding: '4px 8px', borderRadius: 3,
+          background: 'var(--bg-deep)', border: '1px solid var(--border-subtle)'
+        }}>
+          {syncStatus === 'online' && <><Wifi size={10} style={{ color: 'var(--emerald)' }}/><span className="font-mono" style={{ fontSize: 10, color: 'var(--emerald)' }}>SYNCED</span></>}
+          {syncStatus === 'syncing' && <><Wifi size={10} style={{ color: '#d97706' }} className="pulse-gold"/><span className="font-mono" style={{ fontSize: 10, color: '#d97706' }}>SYNCING</span></>}
+          {syncStatus === 'offline' && <><WifiOff size={10} style={{ color: 'var(--blood)' }}/><span className="font-mono" style={{ fontSize: 10, color: 'var(--blood)' }}>OFFLINE</span></>}
+          <span className="tooltip-text">Realtime sync status</span>
+        </div>
+      </header>
+    </>
+  );
+}
+
+function FloatingPanel({ title, icon, onClose, children, style }) {
+  return (
+    <div className="panel anim-fade" style={{
+      position: 'absolute', ...style,
+      maxHeight: 'calc(100vh - 180px)', display: 'flex', flexDirection: 'column',
+      zIndex: 20,
+    }}>
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8,
+        padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)',
+        background: 'linear-gradient(180deg, rgba(212,164,55,0.08), transparent)',
+      }}>
+        <span style={{ color: 'var(--gold-bright)' }}>{icon}</span>
+        <div className="font-display" style={{ flex: 1, fontSize: 11, color: 'var(--gold-bright)', letterSpacing: '0.18em' }}>
+          {title.toUpperCase()}
+        </div>
+        <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={12}/></button>
+      </div>
+      <div className="scrollable" style={{ padding: 12, overflowY: 'auto' }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function EntityTypeIcon({ type, color }) {
+  const size = 18;
+  if (type === 'pc') {
+    return (
+      <div style={{ width: size, height: size, borderRadius: '50%', background: color, border: '2px solid var(--bg-obsidian)', flexShrink: 0 }}/>
+    );
+  }
+  if (type === 'monster') {
+    return (
+      <svg width={size} height={size} style={{ flexShrink: 0 }}>
+        <polygon points={`${size/2},0 ${size},${size/2} ${size/2},${size} 0,${size/2}`} fill={color} stroke="var(--bg-obsidian)" strokeWidth="2"/>
+      </svg>
+    );
+  }
+  return (
+    <div style={{ width: size, height: size, borderRadius: 3, background: color, border: '2px solid var(--bg-obsidian)', flexShrink: 0 }}/>
+  );
+}
+
+// ============================================================
+//  INITIATIVE PANEL
+// ============================================================
+
+function InitiativePanel({ session, updateSession, role, playerName }) {
+  const isDM = role === 'dm';
+  const init = session.initiative;
+
+  const rollFor = (ent) => {
+    const r = Math.floor(Math.random() * 20) + 1 + (ent.initBonus || 0);
+    return r;
+  };
+
+  const sorted = useMemo(() => {
+    const withEnts = init.entries
+      .map(en => ({ ...en, entity: session.entities.find(e => e.id === en.entityId) }))
+      .filter(e => e.entity);
+    return [...withEnts].sort((a, b) => {
+      if (b.roll !== a.roll) return b.roll - a.roll;
+      if ((b.entity.initBonus || 0) !== (a.entity.initBonus || 0)) return (b.entity.initBonus || 0) - (a.entity.initBonus || 0);
+      return a.entity.name.localeCompare(b.entity.name);
+    });
+  }, [init, session.entities]);
+
+  const addToInit = (entId, autoRoll = true) => {
+    if (init.entries.find(e => e.entityId === entId)) return;
+    const ent = session.entities.find(e => e.id === entId);
+    if (!ent) return;
+    const roll = autoRoll ? rollFor(ent) : 10;
+    updateSession({
+      ...session,
+      initiative: { ...init, entries: [...init.entries, { entityId: entId, roll }] }
+    });
+  };
+
+  const removeFromInit = (entId) => {
+    updateSession({
+      ...session,
+      initiative: { ...init, entries: init.entries.filter(e => e.entityId !== entId) }
+    });
+  };
+
+  const updateRoll = (entId, roll) => {
+    updateSession({
+      ...session,
+      initiative: { ...init, entries: init.entries.map(e => e.entityId === entId ? { ...e, roll } : e) }
+    });
+  };
+
+  const startOrStop = () => {
+    updateSession({ ...session, initiative: { ...init, active: !init.active, turnIndex: 0, round: 1 } });
+  };
+
+  const nextTurn = () => {
+    const nextIdx = init.turnIndex + 1;
+    if (nextIdx >= sorted.length) {
+      updateSession({ ...session, initiative: { ...init, turnIndex: 0, round: init.round + 1 } });
+    } else {
+      updateSession({ ...session, initiative: { ...init, turnIndex: nextIdx } });
+    }
+  };
+
+  const rollAll = () => {
+    const entries = init.entries.map(en => {
+      const ent = session.entities.find(e => e.id === en.entityId);
+      return { ...en, roll: ent ? rollFor(ent) : en.roll };
+    });
+    updateSession({ ...session, initiative: { ...init, entries, turnIndex: 0, round: 1 } });
+  };
+
+  // Player view: show sorted subset (PCs + visible enemies)
+  const visibleForPlayer = (entry) => {
+    if (isDM) return true;
+    if (entry.entity.type === 'pc') return true;
+    // visible if any token for this entity on any map player can see is visible
+    const toks = session.tokens.filter(t => t.entityId === entry.entity.id);
+    return toks.some(t => t.visible);
+  };
+
+  const displaySorted = sorted.filter(visibleForPlayer);
+
+  if (!isDM) {
+    return (
+      <div>
+        {!init.active && <div style={{ color: 'var(--ink-faint)', fontSize: 12, fontStyle: 'italic', textAlign: 'center', padding: 10 }}>No encounter in progress.</div>}
+        {init.active && (
+          <>
+            <div className="font-mono" style={{ fontSize: 10, color: 'var(--gold)', textAlign: 'center', marginBottom: 8, letterSpacing: '0.15em' }}>
+              ROUND {init.round}
+            </div>
+            {displaySorted.map((en, i) => {
+              const isCurrent = sorted[init.turnIndex]?.entityId === en.entityId;
+              return (
+                <div key={en.entityId} style={{
+                  padding: '8px 10px', marginBottom: 4, borderRadius: 4,
+                  border: `1px solid ${isCurrent ? 'var(--gold)' : 'var(--border-subtle)'}`,
+                  background: isCurrent ? 'rgba(212,164,55,0.12)' : 'var(--bg-deep)',
+                  display: 'flex', alignItems: 'center', gap: 8
+                }}>
+                  <EntityTypeIcon type={en.entity.type} color={en.entity.color} />
+                  <div style={{ flex: 1 }}>
+                    <div className="font-display" style={{ fontSize: 12, letterSpacing: '0.08em', color: isCurrent ? 'var(--gold-bright)' : 'var(--ink)' }}>
+                      {en.entity.name}
+                    </div>
+                  </div>
+                  <div className="font-mono" style={{ fontSize: 14, color: isCurrent ? 'var(--gold-bright)' : 'var(--ink-dim)' }}>
+                    {en.roll}
+                  </div>
+                </div>
+              );
+            })}
+          </>
+        )}
+      </div>
+    );
+  }
+
+  // DM view
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+        <button className={`btn ${init.active ? 'btn-danger' : 'btn-primary'}`} style={{ flex: 1, padding: '6px 8px' }} onClick={startOrStop}>
+          {init.active ? <><Pause size={11}/> End</> : <><Play size={11}/> Begin</>}
+        </button>
+        <button className="btn" style={{ padding: '6px 8px' }} onClick={rollAll} disabled={init.entries.length === 0}>
+          <Dices size={11}/> Re-roll
+        </button>
+      </div>
+
+      {init.active && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, padding: '6px 10px', background: 'var(--bg-deep)', borderRadius: 3 }}>
+            <span className="font-mono" style={{ fontSize: 10, color: 'var(--gold)', letterSpacing: '0.15em' }}>ROUND {init.round}</span>
+            <div style={{ flex: 1 }}/>
+            <button className="btn btn-primary" style={{ padding: '4px 8px', fontSize: 10 }} onClick={nextTurn}>
+              <ArrowRightCircle size={10}/> Next Turn
+            </button>
+          </div>
+        </>
+      )}
+
+      {sorted.length === 0 && (
+        <div style={{ color: 'var(--ink-faint)', fontSize: 12, fontStyle: 'italic', textAlign: 'center', padding: 16 }}>
+          Add combatants below.
+        </div>
+      )}
+      {sorted.map((en, i) => {
+        const isCurrent = init.active && i === init.turnIndex;
+        return (
+          <div key={en.entityId} style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px', marginBottom: 4,
+            border: `1px solid ${isCurrent ? 'var(--gold)' : 'var(--border-subtle)'}`,
+            borderRadius: 4,
+            background: isCurrent ? 'rgba(212,164,55,0.12)' : 'var(--bg-deep)',
+          }}>
+            <EntityTypeIcon type={en.entity.type} color={en.entity.color} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="font-display" style={{ fontSize: 11, letterSpacing: '0.08em', color: isCurrent ? 'var(--gold-bright)' : 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {en.entity.name}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--ink-dim)' }} className="font-mono">
+                init {en.entity.initBonus >= 0 ? '+' : ''}{en.entity.initBonus || 0}
+              </div>
+            </div>
+            <input
+              type="number"
+              className="input mono"
+              style={{ width: 44, padding: '2px 4px', textAlign: 'center', fontSize: 13 }}
+              value={en.roll}
+              onChange={e => updateRoll(en.entityId, parseInt(e.target.value) || 0)}
+            />
+            <button className="btn btn-ghost btn-icon" onClick={() => removeFromInit(en.entityId)}>
+              <X size={10}/>
+            </button>
+          </div>
+        );
+      })}
+
+      <div className="divider-gold"/>
+      <div className="label" style={{ marginBottom: 6 }}>Add Combatant</div>
+      <select className="input" onChange={(e) => { if (e.target.value) { addToInit(e.target.value); e.target.value = ''; } }} defaultValue="">
+        <option value="">Choose an entity…</option>
+        {session.entities.filter(e => !init.entries.find(en => en.entityId === e.id)).map(e => (
+          <option key={e.id} value={e.id}>{e.name} ({e.type})</option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+// ============================================================
+//  MAP MANAGER PANEL
+// ============================================================
+
+function MapManagerPanel({ session, updateSession, changeMap }) {
+  const [editing, setEditing] = useState(null);
+  const [newParent, setNewParent] = useState('none');
+
+  const addMap = () => {
+    const m = {
+      id: uid(), name: 'New Map', type: 'region',
+      parentId: newParent === 'none' ? null : newParent,
+      imageUrl: '', notes: '', viewport: { x: 0, y: 0, w: 1200, h: 800 }
+    };
+    updateSession({ ...session, maps: [...session.maps, m] });
+    setEditing(m.id);
+  };
+
+  const deleteMap = (id) => {
+    if (session.maps.length === 1) return alert('You need at least one map.');
+    if (!confirm('Delete this map and all tokens on it?')) return;
+    const next = {
+      ...session,
+      maps: session.maps.filter(m => m.id !== id).map(m => m.parentId === id ? { ...m, parentId: null } : m),
+      tokens: session.tokens.filter(t => t.mapId !== id),
+    };
+    if (next.currentMapId === id) next.currentMapId = next.maps[0].id;
+    if (next.forcedView?.mapId === id) next.forcedView = null;
+    updateSession(next);
+  };
+
+  const updateMap = (id, patch) => {
+    updateSession({ ...session, maps: session.maps.map(m => m.id === id ? { ...m, ...patch } : m) });
+  };
+
+  // build tree
+  const renderTree = (parentId = null, depth = 0) => {
+    const children = session.maps.filter(m => (m.parentId || null) === parentId);
+    return children.map(m => (
+      <div key={m.id}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 4, padding: '4px 6px',
+          marginLeft: depth * 14, borderRadius: 3,
+          background: session.currentMapId === m.id ? 'rgba(212,164,55,0.1)' : 'transparent',
+          border: `1px solid ${session.currentMapId === m.id ? 'var(--gold-muted)' : 'transparent'}`
+        }}>
+          <MapIcon size={10} style={{ color: 'var(--gold-muted)', flexShrink: 0 }}/>
+          <button
+            onClick={() => changeMap(m.id)}
+            className="font-display"
+            style={{
+              flex: 1, background: 'none', border: 'none', cursor: 'pointer',
+              color: session.currentMapId === m.id ? 'var(--gold-bright)' : 'var(--ink)',
+              fontSize: 11, letterSpacing: '0.08em', textAlign: 'left',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+            }}
+          >
+            {m.name}
+          </button>
+          <span className="chip" style={{ fontSize: 8, padding: '1px 5px' }}>{m.type}</span>
+          <button className="btn btn-ghost btn-icon" onClick={() => setEditing(m.id === editing ? null : m.id)}><Edit3 size={9}/></button>
+          <button className="btn btn-ghost btn-icon btn-danger" onClick={() => deleteMap(m.id)}><Trash2 size={9}/></button>
+        </div>
+        {editing === m.id && (
+          <div style={{ marginLeft: depth * 14 + 14, padding: 8, background: 'var(--bg-deep)', border: '1px solid var(--border-subtle)', borderRadius: 3, marginBottom: 4 }}>
+            <div className="label" style={{ marginBottom: 3 }}>Name</div>
+            <input className="input" style={{ fontSize: 12, padding: '4px 6px', marginBottom: 6 }} value={m.name} onChange={e => updateMap(m.id, { name: e.target.value })}/>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+              <div style={{ flex: 1 }}>
+                <div className="label" style={{ marginBottom: 3 }}>Type</div>
+                <select className="input" style={{ fontSize: 12, padding: '4px 6px' }} value={m.type} onChange={e => updateMap(m.id, { type: e.target.value })}>
+                  {MAP_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
+              <div style={{ flex: 1 }}>
+                <div className="label" style={{ marginBottom: 3 }}>Parent</div>
+                <select className="input" style={{ fontSize: 12, padding: '4px 6px' }} value={m.parentId || 'none'} onChange={e => updateMap(m.id, { parentId: e.target.value === 'none' ? null : e.target.value })}>
+                  <option value="none">— None —</option>
+                  {session.maps.filter(x => x.id !== m.id).map(x => <option key={x.id} value={x.id}>{x.name}</option>)}
+                </select>
+              </div>
+            </div>
+            <div className="label" style={{ marginBottom: 3 }}>Image URL (optional)</div>
+            <input className="input" style={{ fontSize: 11, padding: '4px 6px', marginBottom: 6 }} value={m.imageUrl} onChange={e => updateMap(m.id, { imageUrl: e.target.value })} placeholder="https://…"/>
+            <div className="label" style={{ marginBottom: 3 }}>Notes</div>
+            <textarea className="input" style={{ fontSize: 12, padding: '4px 6px' }} rows={2} value={m.notes} onChange={e => updateMap(m.id, { notes: e.target.value })}/>
+          </div>
+        )}
+        {renderTree(m.id, depth + 1)}
+      </div>
+    ));
+  };
+
+  return (
+    <div>
+      <button className="btn btn-primary" style={{ width: '100%', padding: '6px 10px' }} onClick={addMap}>
+        <Plus size={11}/> Scribe New Map
+      </button>
+      <div className="divider-gold"/>
+      {renderTree()}
+    </div>
+  );
+}
+
+// ============================================================
+//  PRESETS PANEL
+// ============================================================
+
+function PresetsPanel({ session, updateSession, currentMap }) {
+  const [name, setName] = useState('');
+
+  const save = () => {
+    if (!name.trim() || !currentMap) return;
+    const preset = {
+      id: uid(), name: name.trim(), mapId: currentMap.id,
+      tokens: session.tokens.filter(t => t.mapId === currentMap.id).map(t => ({ entityId: t.entityId, x: t.x, y: t.y, visible: t.visible }))
+    };
+    updateSession({ ...session, presets: [...session.presets, preset] });
+    setName('');
+  };
+
+  const load = (preset) => {
+    if (!confirm(`Restore "${preset.name}"? This replaces current tokens on that map.`)) return;
+    const otherTokens = session.tokens.filter(t => t.mapId !== preset.mapId);
+    const newTokens = preset.tokens.map(p => ({
+      id: uid(), entityId: p.entityId, mapId: preset.mapId, x: p.x, y: p.y, visible: p.visible
+    }));
+    updateSession({ ...session, currentMapId: preset.mapId, tokens: [...otherTokens, ...newTokens] });
+  };
+
+  const del = (id) => {
+    updateSession({ ...session, presets: session.presets.filter(p => p.id !== id) });
+  };
+
+  const overwrite = (preset) => {
+    if (!confirm(`Overwrite "${preset.name}" with current map state?`)) return;
+    const newTokens = session.tokens.filter(t => t.mapId === preset.mapId).map(t => ({ entityId: t.entityId, x: t.x, y: t.y, visible: t.visible }));
+    updateSession({ ...session, presets: session.presets.map(p => p.id === preset.id ? { ...p, tokens: newTokens } : p) });
+  };
+
+  return (
+    <div>
+      <div className="label" style={{ marginBottom: 4 }}>Save current map state</div>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+        <input className="input" placeholder="Scroll name…" value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === 'Enter' && save()}/>
+        <button className="btn btn-primary" onClick={save} disabled={!name.trim()}><Save size={11}/></button>
+      </div>
+      <div className="divider-gold"/>
+      {session.presets.length === 0 && (
+        <div style={{ textAlign: 'center', color: 'var(--ink-faint)', fontSize: 12, padding: 16, fontStyle: 'italic' }}>
+          No scrolls yet.
+        </div>
+      )}
+      {session.presets.map(p => {
+        const map = session.maps.find(m => m.id === p.mapId);
+        return (
+          <div key={p.id} style={{
+            padding: 8, marginBottom: 6, borderRadius: 3,
+            border: '1px solid var(--border-subtle)', background: 'var(--bg-deep)'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Scroll size={12} style={{ color: 'var(--gold-muted)' }}/>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="font-display" style={{ fontSize: 12, color: 'var(--ink)', letterSpacing: '0.08em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.name}</div>
+                <div className="font-mono" style={{ fontSize: 9, color: 'var(--ink-faint)' }}>{map?.name || '(missing map)'} · {p.tokens.length} tokens</div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 4, marginTop: 6 }}>
+              <button className="btn" style={{ padding: '3px 6px', fontSize: 9, flex: 1 }} onClick={() => load(p)}><FolderOpen size={9}/> Load</button>
+              <button className="btn" style={{ padding: '3px 6px', fontSize: 9 }} onClick={() => overwrite(p)}><Save size={9}/></button>
+              <button className="btn btn-danger" style={{ padding: '3px 6px', fontSize: 9 }} onClick={() => del(p.id)}><Trash2 size={9}/></button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ============================================================
+//  TOKEN DETAIL PANEL (floating bottom-left)
+// ============================================================
+
+function TokenDetailPanel({ token, entity, onClose, role, session, updateEntity, toggleVisibility, adjustHP, toggleCondition, onRemoveToken }) {
+  const isDM = role === 'dm';
+  const canEditNotes = isDM || (entity.type === 'pc' && session.claims && Object.values(session.claims).includes(entity.id));
+
+  return (
+    <div className="panel anim-fade" style={{
+      position: 'absolute', bottom: 16, left: 16, width: 340,
+      maxHeight: 'calc(100vh - 180px)', display: 'flex', flexDirection: 'column', zIndex: 30,
+    }}>
+      <div style={{
+        padding: '10px 12px', borderBottom: '1px solid var(--border-subtle)',
+        display: 'flex', alignItems: 'center', gap: 8,
+        background: `linear-gradient(180deg, ${entity.color}22, transparent)`
+      }}>
+        <EntityTypeIcon type={entity.type} color={entity.color} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="font-display" style={{ fontSize: 13, color: 'var(--ink)', letterSpacing: '0.1em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{entity.name}</div>
+          <div className="font-mono" style={{ fontSize: 9, color: 'var(--ink-dim)', letterSpacing: '0.1em' }}>
+            {entity.type.toUpperCase()}
+            {entity.type === 'pc' && entity.class && ` · ${entity.class.toUpperCase()} ${entity.level || ''}`}
+            {entity.type === 'monster' && entity.cr && ` · CR ${entity.cr}`}
+            {entity.type === 'npc' && entity.faction && ` · ${entity.faction.toUpperCase()}`}
+          </div>
+        </div>
+        {isDM && (
+          <button className="btn btn-ghost btn-icon tooltip-parent" onClick={toggleVisibility}>
+            {token.visible ? <Eye size={12}/> : <EyeOff size={12}/>}
+            <span className="tooltip-text">{token.visible ? 'Hide from players' : 'Reveal to players'}</span>
+          </button>
+        )}
+        <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={12}/></button>
+      </div>
+
+      <div className="scrollable" style={{ padding: 12, overflowY: 'auto' }}>
+        {/* HP / AC row */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 10 }}>
+          <div style={{ padding: '8px 10px', border: '1px solid var(--border-subtle)', borderRadius: 3, background: 'var(--bg-deep)' }}>
+            <div className="label" style={{ marginBottom: 2 }}>HIT POINTS</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Heart size={12} style={{ color: entity.hp / entity.maxHp > 0.5 ? 'var(--emerald)' : 'var(--blood)' }}/>
+              <span className="font-mono" style={{ fontSize: 16, color: 'var(--ink)' }}>{entity.hp}<span style={{ color: 'var(--ink-faint)', fontSize: 12 }}>/{entity.maxHp}</span></span>
+              {isDM && (
+                <div style={{ marginLeft: 'auto', display: 'flex', gap: 2 }}>
+                  <button className="btn btn-ghost btn-icon" onClick={() => adjustHP(entity.id, -1)}><Minus size={10}/></button>
+                  <button className="btn btn-ghost btn-icon" onClick={() => adjustHP(entity.id, 1)}><Plus size={10}/></button>
+                </div>
+              )}
+            </div>
+          </div>
+          <div style={{ padding: '8px 10px', border: '1px solid var(--border-subtle)', borderRadius: 3, background: 'var(--bg-deep)' }}>
+            <div className="label" style={{ marginBottom: 2 }}>ARMOR CLASS</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Shield size={12} style={{ color: 'var(--azure)' }}/>
+              <span className="font-mono" style={{ fontSize: 16, color: 'var(--ink)' }}>{entity.ac}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Quick damage (DM) */}
+        {isDM && (
+          <div style={{ display: 'flex', gap: 4, marginBottom: 10 }}>
+            {[-10, -5, -1, 1, 5, 10].map(n => (
+              <button key={n} className="btn" style={{ flex: 1, padding: '4px 0', fontSize: 10 }} onClick={() => adjustHP(entity.id, n)}>
+                {n > 0 ? `+${n}` : n}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* stats */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 4, marginBottom: 10 }}>
+          {['str', 'dex', 'con', 'int', 'wis', 'cha'].map(s => (
+            <div key={s} className="stat-cell">
+              <div className="label-s">{s.toUpperCase()}</div>
+              <div className="val">{entity.stats?.[s] ?? 10}</div>
+              <div className="modv">{formatMod(entity.stats?.[s] ?? 10)}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* meta */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 10, fontSize: 11 }}>
+          <div><span className="label">SPEED </span><span className="font-mono">{entity.speed ?? 30}ft</span></div>
+          <div><span className="label">PASSIVE </span><span className="font-mono">{entity.passivePerception ?? 10}</span></div>
+          <div><span className="label">INIT </span><span className="font-mono">{(entity.initBonus ?? 0) >= 0 ? '+' : ''}{entity.initBonus ?? 0}</span></div>
+          {entity.type === 'pc' && entity.playerName && <div><span className="label">PLAYER </span><span>{entity.playerName}</span></div>}
+        </div>
+
+        {/* conditions */}
+        <div className="label" style={{ marginBottom: 4 }}>Conditions</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 10 }}>
+          {CONDITIONS.map(c => {
+            const active = entity.conditions?.includes(c);
+            if (!isDM && !active) return null; // players only see active ones
+            return (
+              <button
+                key={c}
+                className={`chip ${active ? 'chip-cond' : ''}`}
+                onClick={() => isDM && toggleCondition(entity.id, c)}
+                disabled={!isDM}
+                style={{ cursor: isDM ? 'pointer' : 'default', border: 'none', padding: '3px 8px' }}
+              >
+                {c}
+              </button>
+            );
+          })}
+          {!isDM && (!entity.conditions || entity.conditions.length === 0) && (
+            <span style={{ color: 'var(--ink-faint)', fontSize: 11, fontStyle: 'italic' }}>None</span>
+          )}
+        </div>
+
+        {/* abilities (monster) */}
+        {entity.type === 'monster' && entity.abilities && (
+          <>
+            <div className="label" style={{ marginBottom: 4 }}>Abilities</div>
+            <div style={{ fontSize: 12, padding: 8, background: 'var(--bg-deep)', borderRadius: 3, border: '1px solid var(--border-subtle)', marginBottom: 10, whiteSpace: 'pre-wrap', fontStyle: 'italic', lineHeight: 1.4 }}>
+              {entity.abilities}
+            </div>
+          </>
+        )}
+
+        {/* notes */}
+        {(isDM || entity.type === 'pc') && (
+          <>
+            <div className="label" style={{ marginBottom: 4 }}>Notes {!isDM && <span style={{ textTransform: 'none' }}>(your character only)</span>}</div>
+            {canEditNotes ? (
+              <textarea
+                className="input"
+                style={{ fontSize: 12, padding: 6 }}
+                rows={3}
+                value={entity.notes || ''}
+                onChange={e => updateEntity(entity.id, { notes: e.target.value })}
+                placeholder={isDM ? 'DM notes…' : 'Your notes…'}
+              />
+            ) : (
+              <div style={{ fontSize: 12, padding: 8, background: 'var(--bg-deep)', borderRadius: 3, border: '1px solid var(--border-subtle)', color: 'var(--ink-dim)', fontStyle: 'italic' }}>
+                {entity.notes || '—'}
+              </div>
+            )}
+          </>
+        )}
+
+        {isDM && (
+          <div style={{ display: 'flex', gap: 6, marginTop: 12 }}>
+            <button className="btn btn-danger" style={{ flex: 1, padding: '5px 8px', fontSize: 10 }} onClick={onRemoveToken}>
+              <Trash2 size={11}/> Remove Token
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+//  ENTITY EDITOR MODAL
+// ============================================================
+
+function EntityEditorModal({ entity, isNew, onSave, onDelete, onClose }) {
+  const [e, setE] = useState(entity);
+
+  const upd = (patch) => setE(prev => ({ ...prev, ...patch }));
+  const updStat = (s, v) => setE(prev => ({ ...prev, stats: { ...(prev.stats || DEFAULT_STATS), [s]: v } }));
+
+  return (
+    <div className="modal-bg anim-fade" onClick={onClose}>
+      <div className="modal-body" style={{ width: 540 }} onClick={ev => ev.stopPropagation()}>
+        <div style={{
+          padding: '12px 16px', borderBottom: '1px solid var(--border-subtle)',
+          display: 'flex', alignItems: 'center', gap: 10,
+          background: `linear-gradient(180deg, ${e.color}22, transparent)`
+        }}>
+          <EntityTypeIcon type={e.type} color={e.color}/>
+          <div className="font-display" style={{ flex: 1, fontSize: 14, color: 'var(--gold-bright)', letterSpacing: '0.15em' }}>
+            {isNew ? 'FORGE NEW ENTITY' : 'EDIT ENTITY'}
+          </div>
+          <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={14}/></button>
+        </div>
+
+        <div className="scrollable" style={{ padding: 16, maxHeight: '70vh', overflowY: 'auto' }}>
+          {/* name + type + color */}
+          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 10, marginBottom: 10 }}>
+            <div>
+              <div className="label" style={{ marginBottom: 3 }}>Name</div>
+              <input className="input" value={e.name} onChange={ev => upd({ name: ev.target.value })}/>
+            </div>
+            <div>
+              <div className="label" style={{ marginBottom: 3 }}>Type</div>
+              <select className="input" value={e.type} onChange={ev => upd({ type: ev.target.value })}>
+                <option value="pc">Player Character</option>
+                <option value="monster">Monster</option>
+                <option value="npc">NPC</option>
+              </select>
+            </div>
+          </div>
+
+          {/* color picker */}
+          <div className="label" style={{ marginBottom: 4 }}>Token Color</div>
+          <div style={{ display: 'flex', gap: 4, marginBottom: 12 }}>
+            {ENTITY_COLORS.map(c => (
+              <button
+                key={c}
+                onClick={() => upd({ color: c })}
+                style={{
+                  width: 28, height: 28, borderRadius: '50%',
+                  background: c,
+                  border: e.color === c ? '2px solid var(--gold-bright)' : '2px solid var(--border-subtle)',
+                  cursor: 'pointer', padding: 0,
+                  boxShadow: e.color === c ? '0 0 8px ' + c : 'none'
+                }}
+              />
+            ))}
+          </div>
+
+          {/* combat stats */}
+          <div className="label" style={{ marginBottom: 4 }}>Combat</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 6, marginBottom: 12 }}>
+            <div>
+              <div className="label-s" style={{ fontSize: 9, color: 'var(--ink-faint)', marginBottom: 2 }}>AC</div>
+              <input className="input mono" type="number" value={e.ac ?? 10} onChange={ev => upd({ ac: parseInt(ev.target.value) || 0 })}/>
+            </div>
+            <div>
+              <div className="label-s" style={{ fontSize: 9, color: 'var(--ink-faint)', marginBottom: 2 }}>HP</div>
+              <input className="input mono" type="number" value={e.hp ?? 0} onChange={ev => upd({ hp: parseInt(ev.target.value) || 0 })}/>
+            </div>
+            <div>
+              <div className="label-s" style={{ fontSize: 9, color: 'var(--ink-faint)', marginBottom: 2 }}>MAX HP</div>
+              <input className="input mono" type="number" value={e.maxHp ?? 0} onChange={ev => upd({ maxHp: parseInt(ev.target.value) || 0 })}/>
+            </div>
+            <div>
+              <div className="label-s" style={{ fontSize: 9, color: 'var(--ink-faint)', marginBottom: 2 }}>SPEED</div>
+              <input className="input mono" type="number" value={e.speed ?? 30} onChange={ev => upd({ speed: parseInt(ev.target.value) || 0 })}/>
+            </div>
+            <div>
+              <div className="label-s" style={{ fontSize: 9, color: 'var(--ink-faint)', marginBottom: 2 }}>INIT</div>
+              <input className="input mono" type="number" value={e.initBonus ?? 0} onChange={ev => upd({ initBonus: parseInt(ev.target.value) || 0 })}/>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
+            <div>
+              <div className="label" style={{ marginBottom: 3 }}>Passive Perception</div>
+              <input className="input mono" type="number" value={e.passivePerception ?? 10} onChange={ev => upd({ passivePerception: parseInt(ev.target.value) || 0 })}/>
+            </div>
+            <div>
+              <div className="label" style={{ marginBottom: 3 }}>Custom Stat (label:val)</div>
+              <input className="input" value={e.customStat || ''} onChange={ev => upd({ customStat: ev.target.value })} placeholder="e.g. Spell DC: 16"/>
+            </div>
+          </div>
+
+          {/* ability scores */}
+          <div className="label" style={{ marginBottom: 4 }}>Ability Scores</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 6, marginBottom: 12 }}>
+            {['str', 'dex', 'con', 'int', 'wis', 'cha'].map(s => (
+              <div key={s}>
+                <div className="label-s" style={{ fontSize: 9, color: 'var(--ink-faint)', marginBottom: 2, textAlign: 'center' }}>{s.toUpperCase()}</div>
+                <input
+                  className="input mono"
+                  type="number"
+                  style={{ textAlign: 'center' }}
+                  value={e.stats?.[s] ?? 10}
+                  onChange={ev => updStat(s, parseInt(ev.target.value) || 10)}
+                />
+                <div className="modv" style={{ textAlign: 'center', marginTop: 2, fontFamily: 'JetBrains Mono', fontSize: 10, color: 'var(--gold)' }}>
+                  {formatMod(e.stats?.[s] ?? 10)}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* type-specific */}
+          {e.type === 'pc' && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 12 }}>
+              <div>
+                <div className="label" style={{ marginBottom: 3 }}>Class</div>
+                <input className="input" value={e.class || ''} onChange={ev => upd({ class: ev.target.value })}/>
+              </div>
+              <div>
+                <div className="label" style={{ marginBottom: 3 }}>Level</div>
+                <input className="input mono" type="number" value={e.level || 1} onChange={ev => upd({ level: parseInt(ev.target.value) || 1 })}/>
+              </div>
+              <div>
+                <div className="label" style={{ marginBottom: 3 }}>Player</div>
+                <input className="input" value={e.playerName || ''} onChange={ev => upd({ playerName: ev.target.value })}/>
+              </div>
+            </div>
+          )}
+          {e.type === 'monster' && (
+            <>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 3fr', gap: 10, marginBottom: 12 }}>
+                <div>
+                  <div className="label" style={{ marginBottom: 3 }}>CR</div>
+                  <input className="input mono" value={e.cr || ''} onChange={ev => upd({ cr: ev.target.value })} placeholder="1/4"/>
+                </div>
+                <div>
+                  <div className="label" style={{ marginBottom: 3 }}>Abilities / Actions</div>
+                  <textarea className="input" rows={3} value={e.abilities || ''} onChange={ev => upd({ abilities: ev.target.value })} placeholder="Multiattack, special abilities, etc."/>
+                </div>
+              </div>
+            </>
+          )}
+          {e.type === 'npc' && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 12 }}>
+              <div>
+                <div className="label" style={{ marginBottom: 3 }}>Faction</div>
+                <input className="input" value={e.faction || ''} onChange={ev => upd({ faction: ev.target.value })}/>
+              </div>
+              <div>
+                <div className="label" style={{ marginBottom: 3 }}>Role</div>
+                <input className="input" value={e.role || ''} onChange={ev => upd({ role: ev.target.value })}/>
+              </div>
+            </div>
+          )}
+
+          {/* notes */}
+          <div className="label" style={{ marginBottom: 3 }}>Notes</div>
+          <textarea className="input" rows={3} value={e.notes || ''} onChange={ev => upd({ notes: ev.target.value })}/>
+        </div>
+
+        {/* footer */}
+        <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border-subtle)', display: 'flex', gap: 8 }}>
+          {onDelete && <button className="btn btn-danger" onClick={onDelete}><Trash2 size={11}/> Delete</button>}
+          <div style={{ flex: 1 }}/>
+          <button className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" onClick={() => onSave(e)}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+//  SETTINGS MODAL (DM only)
+// ============================================================
+
+function SettingsModal({ session, updateSession, onClose }) {
+  const [tab, setTab] = useState('general'); // general | security | data
+  const [newPass, setNewPass] = useState('');
+  const [passMsg, setPassMsg] = useState(null);
+  const fileInput = useRef(null);
+
+  const exportJson = () => {
+    const blob = new Blob([JSON.stringify(session, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `arcanum-session-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importJson = async (file) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!parsed.maps || !parsed.entities || !parsed.tokens) {
+        alert('Invalid session file.');
+        return;
+      }
+      if (!confirm('Import will replace the current session. Continue?')) return;
+      updateSession({ ...parsed, version: (session.version || 0) + 1 });
+      onClose();
+    } catch (err) {
+      alert('Failed to parse file: ' + err.message);
+    }
+  };
+
+  const resetSession = () => {
+    if (!confirm('Wipe all maps, entities, tokens, and presets? This cannot be undone.')) return;
+    updateSession(createDefaultSession());
+    onClose();
+  };
+
+  const changePassword = async () => {
+    if (newPass.length < 3) { setPassMsg({ type: 'err', text: 'Too short (min 3 chars).' }); return; }
+    await storage.setDMPass(newPass);
+    setPassMsg({ type: 'ok', text: 'Passphrase updated.' });
+    setNewPass('');
+  };
+
+  return (
+    <div className="modal-bg anim-fade" onClick={onClose}>
+      <div className="modal-body" style={{ width: 560 }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <Settings size={16} style={{ color: 'var(--gold-bright)' }}/>
+          <div className="font-display" style={{ flex: 1, fontSize: 14, color: 'var(--gold-bright)', letterSpacing: '0.15em' }}>
+            SANCTUM SETTINGS
+          </div>
+          <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={14}/></button>
+        </div>
+        <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)', padding: '0 8px' }}>
+          <button className={`tab-btn ${tab === 'general' ? 'active' : ''}`} onClick={() => setTab('general')}>General</button>
+          <button className={`tab-btn ${tab === 'security' ? 'active' : ''}`} onClick={() => setTab('security')}>Passphrase</button>
+          <button className={`tab-btn ${tab === 'data' ? 'active' : ''}`} onClick={() => setTab('data')}>Session Data</button>
+        </div>
+        <div style={{ padding: 20 }}>
+          {tab === 'general' && (
+            <>
+              <div className="label" style={{ marginBottom: 8 }}>Player View</div>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 10, padding: 10, background: 'var(--bg-deep)', borderRadius: 3, cursor: 'pointer', marginBottom: 10, border: '1px solid var(--border-subtle)' }}>
+                <input
+                  type="checkbox"
+                  checked={session.settings?.showAllPCsToPlayers ?? true}
+                  onChange={ev => updateSession({ ...session, settings: { ...session.settings, showAllPCsToPlayers: ev.target.checked } })}
+                />
+                <div>
+                  <div style={{ fontSize: 13 }}>Show all PC tokens to players by default</div>
+                  <div style={{ fontSize: 11, color: 'var(--ink-dim)', fontStyle: 'italic' }}>If off, PCs are only visible when explicitly revealed.</div>
+                </div>
+              </label>
+            </>
+          )}
+          {tab === 'security' && (
+            <>
+              <div className="label" style={{ marginBottom: 6 }}>Change DM Passphrase</div>
+              <p style={{ fontSize: 12, color: 'var(--ink-dim)', marginBottom: 10, fontStyle: 'italic' }}>
+                The passphrase gates the DM seat. For production deployments, replace this with proper JWT-backed auth.
+              </p>
+              <input
+                className="input" type="password" placeholder="New passphrase…"
+                value={newPass} onChange={e => setNewPass(e.target.value)}
+              />
+              {passMsg && (
+                <div style={{ marginTop: 8, padding: '6px 10px', borderRadius: 3, fontSize: 12, background: passMsg.type === 'ok' ? 'rgba(122,168,85,0.15)' : 'rgba(185,74,74,0.15)', color: passMsg.type === 'ok' ? 'var(--emerald)' : '#e89090' }}>
+                  {passMsg.text}
+                </div>
+              )}
+              <button className="btn btn-primary" style={{ marginTop: 10 }} onClick={changePassword}><Lock size={11}/> Update Passphrase</button>
+            </>
+          )}
+          {tab === 'data' && (
+            <>
+              <div className="label" style={{ marginBottom: 6 }}>Export Session</div>
+              <p style={{ fontSize: 12, color: 'var(--ink-dim)', marginBottom: 8, fontStyle: 'italic' }}>Download the entire session as JSON.</p>
+              <button className="btn" onClick={exportJson}><Download size={11}/> Export JSON</button>
+              <div className="divider-gold"/>
+              <div className="label" style={{ marginBottom: 6 }}>Import Session</div>
+              <p style={{ fontSize: 12, color: 'var(--ink-dim)', marginBottom: 8, fontStyle: 'italic' }}>Replace current session with an imported JSON file.</p>
+              <input ref={fileInput} type="file" accept="application/json" style={{ display: 'none' }} onChange={e => importJson(e.target.files[0])}/>
+              <button className="btn" onClick={() => fileInput.current?.click()}><Upload size={11}/> Import JSON</button>
+              <div className="divider-gold"/>
+              <div className="label" style={{ marginBottom: 6, color: 'var(--blood)' }}>Danger Zone</div>
+              <button className="btn btn-danger" onClick={resetSession}><Trash2 size={11}/> Reset Entire Session</button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+//  PLAYER INTERFACE
+// ============================================================
+
+function PlayerInterface({ session, playerName, onLogout, syncStatus, onMoveOwnToken, onClaimPC, onUnclaimPC, onCreatePC }) {
+  const [showPartyPanel, setShowPartyPanel] = useState(true);
+  const [showInitPanel, setShowInitPanel] = useState(true);
+  const [tokenDetail, setTokenDetail] = useState(null);
+  const [showClaimModal, setShowClaimModal] = useState(false);
+  const [showCreatePC, setShowCreatePC] = useState(false);
+
+  // forced view overrides map selection
+  const forcedMapId = session.forcedView?.mapId;
+  const currentMap = forcedMapId
+    ? session.maps.find(m => m.id === forcedMapId)
+    : session.maps.find(m => m.id === session.currentMapId);
+
+  const claimedEntityId = session.claims?.[playerName];
+  const claimedEntity = session.entities.find(e => e.id === claimedEntityId);
+
+  // which PCs exist and their claim status
+  const pcs = session.entities.filter(e => e.type === 'pc');
+
+  const visibleEntitiesOnMap = useMemo(() => {
+    if (!currentMap) return [];
+    const tokensHere = session.tokens.filter(t => t.mapId === currentMap.id);
+    return tokensHere.map(t => {
+      const ent = session.entities.find(e => e.id === t.entityId);
+      if (!ent) return null;
+      const showToPlayer = t.visible || (ent.type === 'pc' && session.settings?.showAllPCsToPlayers);
+      if (!showToPlayer) return null;
+      return { token: t, entity: ent };
+    }).filter(Boolean);
+  }, [session, currentMap]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', position: 'relative', zIndex: 1 }}>
+      <TopBar
+        role="player"
+        title={currentMap?.name || 'Waiting…'}
+        subtitle={`Adventurer · ${playerName}`}
+        syncStatus={syncStatus}
+        forcedView={session.forcedView}
+        actions={
+          <>
+            {claimedEntity ? (
+              <div className="tooltip-parent" style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '4px 10px', background: 'var(--bg-deep)', borderRadius: 3,
+                border: `1px solid ${claimedEntity.color}`
+              }}>
+                <EntityTypeIcon type="pc" color={claimedEntity.color}/>
+                <div className="font-display" style={{ fontSize: 11, letterSpacing: '0.1em', color: 'var(--ink)' }}>
+                  {claimedEntity.name.toUpperCase()}
+                </div>
+                <span className="tooltip-text">Your character</span>
+              </div>
+            ) : (
+              <button className="btn btn-primary" onClick={() => setShowClaimModal(true)}>
+                <UserCheck size={12}/> Claim a Hero
+              </button>
+            )}
+            <button className="btn" onClick={() => setShowPartyPanel(!showPartyPanel)}>
+              <Users size={12}/> Party
+            </button>
+            <button className="btn" onClick={() => setShowInitPanel(!showInitPanel)}>
+              <SwordsIcon size={12}/> Initiative
+            </button>
+            <button className="btn btn-ghost btn-icon tooltip-parent" onClick={onLogout}>
+              <LogOut size={14}/>
+              <span className="tooltip-text">Leave the table</span>
+            </button>
+          </>
+        }
+      />
+
+      <div style={{ flex: 1, position: 'relative', minHeight: 0 }}>
+        {currentMap ? (
+          <MapCanvas
+            session={session}
+            map={currentMap}
+            role="player"
+            playerName={playerName}
+            onTokenMove={onMoveOwnToken}
+            onTokenClick={(tok, ent) => setTokenDetail({ token: tok, entity: ent })}
+            onTokenContext={() => {}}
+            onCanvasDrop={() => {}}
+            selectedTokenId={null}
+            draggedEntityId={null}
+          />
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--ink-faint)' }}>
+            <div style={{ textAlign: 'center' }}>
+              <Sparkles size={32} style={{ color: 'var(--gold-muted)', marginBottom: 10 }}/>
+              <div className="font-display" style={{ letterSpacing: '0.2em', fontSize: 14 }}>
+                <span className="ornament">AWAITING THE DM</span>
+              </div>
+              <div style={{ fontSize: 12, marginTop: 8, fontStyle: 'italic' }}>
+                The storyteller is preparing the scene.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showPartyPanel && (
+          <FloatingPanel title="The Party" icon={<Users size={14}/>} onClose={() => setShowPartyPanel(false)} style={{ top: 16, left: 16, width: 280 }}>
+            <div style={{ fontSize: 11, color: 'var(--ink-dim)', marginBottom: 8, fontStyle: 'italic' }}>
+              Visible on this map: {visibleEntitiesOnMap.length}
+            </div>
+            {visibleEntitiesOnMap.map(({ token, entity }) => (
+              <div
+                key={token.id}
+                onClick={() => setTokenDetail({ token, entity })}
+                style={{
+                  padding: '6px 8px', marginBottom: 4, borderRadius: 3,
+                  border: '1px solid var(--border-subtle)', background: 'var(--bg-deep)',
+                  cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', gap: 8
+                }}
+              >
+                <EntityTypeIcon type={entity.type} color={entity.color}/>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="font-display" style={{ fontSize: 12, letterSpacing: '0.08em', color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {entity.name}
+                  </div>
+                  <div style={{ fontSize: 10, color: 'var(--ink-dim)' }} className="font-mono">
+                    {entity.type.toUpperCase()}
+                    {entity.id === claimedEntityId && <span style={{ color: 'var(--gold)', marginLeft: 6 }}>· YOURS</span>}
+                  </div>
+                </div>
+              </div>
+            ))}
+            {visibleEntitiesOnMap.length === 0 && (
+              <div style={{ textAlign: 'center', color: 'var(--ink-faint)', fontSize: 12, padding: 16, fontStyle: 'italic' }}>
+                The scene is empty, for now.
+              </div>
+            )}
+          </FloatingPanel>
+        )}
+
+        {showInitPanel && (
+          <FloatingPanel title="Initiative" icon={<SwordsIcon size={14}/>} onClose={() => setShowInitPanel(false)} style={{ top: 16, right: 16, width: 280 }}>
+            <InitiativePanel session={session} updateSession={() => {}} role="player" playerName={playerName}/>
+          </FloatingPanel>
+        )}
+
+        {tokenDetail && (
+          <TokenDetailPanel
+            token={tokenDetail.token}
+            entity={tokenDetail.entity}
+            onClose={() => setTokenDetail(null)}
+            role="player"
+            session={session}
+            updateEntity={(id, patch) => {
+              // Players can only edit notes of their own PC
+              if (id !== claimedEntityId) return;
+              // We don't have direct update access here; simulate via a light sync
+              const next = { ...session, entities: session.entities.map(e => e.id === id ? { ...e, ...patch } : e) };
+              const toWrite = { ...next, version: (next.version || 0) + 1, updatedAt: Date.now(), updatedBy: `player:${playerName}` };
+              storage.setSession(toWrite);
+            }}
+            toggleVisibility={() => {}}
+            adjustHP={() => {}}
+            toggleCondition={() => {}}
+            onRemoveToken={() => {}}
+          />
+        )}
+      </div>
+
+      {/* Claim modal */}
+      {showClaimModal && (
+        <ClaimHeroModal
+          session={session}
+          playerName={playerName}
+          onClose={() => setShowClaimModal(false)}
+          onClaim={(id) => { onClaimPC(id); setShowClaimModal(false); }}
+          onCreate={() => { setShowClaimModal(false); setShowCreatePC(true); }}
+        />
+      )}
+      {showCreatePC && (
+        <CreatePCModal
+          onClose={() => setShowCreatePC(false)}
+          onCreate={(pc) => { onCreatePC(pc); setShowCreatePC(false); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+//  CLAIM HERO MODAL (player)
+// ============================================================
+
+function ClaimHeroModal({ session, playerName, onClose, onClaim, onCreate }) {
+  const pcs = session.entities.filter(e => e.type === 'pc');
+  const currentClaim = session.claims?.[playerName];
+  const isClaimed = (pcId) => Object.entries(session.claims || {}).find(([name, id]) => id === pcId && name !== playerName);
+
+  return (
+    <div className="modal-bg anim-fade" onClick={onClose}>
+      <div className="modal-body" style={{ width: 480 }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <UserCheck size={16} style={{ color: 'var(--gold-bright)' }}/>
+          <div className="font-display" style={{ flex: 1, fontSize: 14, color: 'var(--gold-bright)', letterSpacing: '0.15em' }}>
+            TAKE UP A HERO
+          </div>
+          <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={14}/></button>
+        </div>
+        <div style={{ padding: 20 }}>
+          <p style={{ fontSize: 13, color: 'var(--ink-dim)', marginBottom: 14, fontStyle: 'italic' }}>
+            Choose an existing hero to control, or forge your own.
+          </p>
+          {pcs.length === 0 && (
+            <div style={{ textAlign: 'center', color: 'var(--ink-faint)', padding: 20, fontSize: 13, fontStyle: 'italic' }}>
+              No heroes have been rolled yet.
+            </div>
+          )}
+          {pcs.map(pc => {
+            const claimedByOther = isClaimed(pc.id);
+            const isMine = currentClaim === pc.id;
+            return (
+              <button
+                key={pc.id}
+                onClick={() => !claimedByOther && onClaim(pc.id)}
+                disabled={!!claimedByOther}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 10, width: '100%',
+                  padding: '10px 12px', marginBottom: 6, borderRadius: 4,
+                  border: `1px solid ${isMine ? 'var(--gold)' : 'var(--border-subtle)'}`,
+                  background: isMine ? 'rgba(212,164,55,0.1)' : 'var(--bg-deep)',
+                  cursor: claimedByOther ? 'not-allowed' : 'pointer',
+                  opacity: claimedByOther ? 0.5 : 1,
+                  color: 'var(--ink)', textAlign: 'left'
+                }}
+              >
+                <EntityTypeIcon type="pc" color={pc.color}/>
+                <div style={{ flex: 1 }}>
+                  <div className="font-display" style={{ fontSize: 13, letterSpacing: '0.1em' }}>{pc.name}</div>
+                  <div className="font-mono" style={{ fontSize: 10, color: 'var(--ink-dim)' }}>
+                    {(pc.class || 'Adventurer').toUpperCase()} · LVL {pc.level || 1} · HP {pc.hp}/{pc.maxHp}
+                  </div>
+                </div>
+                {isMine && <span className="chip chip-active" style={{ fontSize: 9 }}>YOURS</span>}
+                {claimedByOther && <span className="chip" style={{ fontSize: 9 }}>CLAIMED</span>}
+              </button>
+            );
+          })}
+          <div className="divider-gold"/>
+          <button className="btn btn-primary" style={{ width: '100%', padding: '8px 12px' }} onClick={onCreate}>
+            <PlusCircle size={12}/> Forge a New Hero
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CreatePCModal({ onClose, onCreate }) {
+  const [pc, setPc] = useState({
+    name: '', class: 'Fighter', level: 1,
+    color: ENTITY_COLORS[Math.floor(Math.random() * ENTITY_COLORS.length)],
+    ac: 14, hp: 12, maxHp: 12,
+  });
+
+  return (
+    <div className="modal-bg anim-fade" onClick={onClose}>
+      <div className="modal-body" style={{ width: 420 }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: 10 }}>
+          <PlusCircle size={16} style={{ color: 'var(--gold-bright)' }}/>
+          <div className="font-display" style={{ flex: 1, fontSize: 14, color: 'var(--gold-bright)', letterSpacing: '0.15em' }}>
+            FORGE A NEW HERO
+          </div>
+          <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={14}/></button>
+        </div>
+        <div style={{ padding: 20 }}>
+          <div className="label" style={{ marginBottom: 3 }}>Name</div>
+          <input className="input" autoFocus value={pc.name} onChange={e => setPc({ ...pc, name: e.target.value })} placeholder="A name worth remembering…" style={{ marginBottom: 10 }}/>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 10, marginBottom: 10 }}>
+            <div>
+              <div className="label" style={{ marginBottom: 3 }}>Class</div>
+              <input className="input" value={pc.class} onChange={e => setPc({ ...pc, class: e.target.value })}/>
+            </div>
+            <div>
+              <div className="label" style={{ marginBottom: 3 }}>Level</div>
+              <input className="input mono" type="number" value={pc.level} onChange={e => setPc({ ...pc, level: parseInt(e.target.value) || 1 })}/>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 10 }}>
+            <div>
+              <div className="label" style={{ marginBottom: 3 }}>AC</div>
+              <input className="input mono" type="number" value={pc.ac} onChange={e => setPc({ ...pc, ac: parseInt(e.target.value) || 10 })}/>
+            </div>
+            <div>
+              <div className="label" style={{ marginBottom: 3 }}>HP</div>
+              <input className="input mono" type="number" value={pc.hp} onChange={e => setPc({ ...pc, hp: parseInt(e.target.value) || 0 })}/>
+            </div>
+            <div>
+              <div className="label" style={{ marginBottom: 3 }}>Max HP</div>
+              <input className="input mono" type="number" value={pc.maxHp} onChange={e => setPc({ ...pc, maxHp: parseInt(e.target.value) || 0 })}/>
+            </div>
+          </div>
+
+          <div className="label" style={{ marginBottom: 4 }}>Token Color</div>
+          <div style={{ display: 'flex', gap: 4, marginBottom: 16 }}>
+            {ENTITY_COLORS.map(c => (
+              <button
+                key={c}
+                onClick={() => setPc({ ...pc, color: c })}
+                style={{
+                  width: 28, height: 28, borderRadius: '50%', background: c,
+                  border: pc.color === c ? '2px solid var(--gold-bright)' : '2px solid var(--border-subtle)',
+                  cursor: 'pointer', padding: 0
+                }}
+              />
+            ))}
+          </div>
+
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
+            <button className="btn btn-primary" style={{ flex: 2 }} onClick={() => pc.name.trim() && onCreate(pc)} disabled={!pc.name.trim()}>
+              <Sparkles size={11}/> Bring to Life
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
