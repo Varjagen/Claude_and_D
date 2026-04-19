@@ -1,14 +1,123 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import {
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Arcanum — A Virtual Tabletop</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#0b0d14; color:#e8e3d4;
+               font-family: Georgia, serif; overflow:hidden; }
+  #loading { position: fixed; inset:0; display:flex; align-items:center; justify-content:center;
+             color:#d4a437; letter-spacing:0.3em; font-size:12px; text-transform:uppercase; z-index:9999;
+             background:#0b0d14; }
+  #loading::before, #loading::after { content:"✦"; margin:0 12px; opacity:0.6; }
+  #loading.error { color:#b94a4a; letter-spacing:0; text-transform:none; font-size:14px;
+                   padding:40px; text-align:center; }
+</style>
+</head>
+<body>
+  <div id="loading">Kindling the hearth…</div>
+  <div id="root"></div>
+
+  <!-- ============================================================
+       window.storage shim — replicates Claude Artifacts' shared storage
+       using localStorage. BroadcastChannel notifies other tabs on write.
+       NOTE: cross-device sync between two computers requires a real
+       backend (Firebase, Supabase, etc.). This shim handles the same-
+       browser, multi-tab case only.
+       ============================================================ -->
+  <script>
+  (function () {
+    var bc = null;
+    try { bc = new BroadcastChannel('arcanum-vtt-sync-v1'); } catch (e) {}
+    function read(k) {
+      try { var v = localStorage.getItem(k); return v == null ? null : { key:k, value:v }; }
+      catch(e){ return null; }
+    }
+    function write(k,v) {
+      try { localStorage.setItem(k,v); if (bc) try { bc.postMessage({k:k,t:Date.now()}); } catch(e){}
+            return { key:k, value:v }; }
+      catch(e){ return null; }
+    }
+    window.storage = {
+      get:    function(k){ return Promise.resolve(read(k)); },
+      set:    function(k,v){ return Promise.resolve(write(k,v)); },
+      delete: function(k){
+        try { localStorage.removeItem(k); if (bc) try { bc.postMessage({k:k,del:true,t:Date.now()}); } catch(e){}
+              return Promise.resolve({ key:k, deleted:true }); }
+        catch(e){ return Promise.resolve(null); }
+      },
+      list: function(prefix){
+        var out = [];
+        try { for (var i=0; i<localStorage.length; i++) { var k = localStorage.key(i);
+              if (!prefix || (k && k.indexOf(prefix)===0)) out.push(k); } }
+        catch(e){}
+        return Promise.resolve({ keys: out, prefix: prefix || '' });
+      }
+    };
+  })();
+  </script>
+
+  <!-- Stage 1: load React, ReactDOM, lucide-react from esm.sh as ES modules
+       and pin them onto window so a plain <script> can use them. -->
+  <script type="module">
+    try {
+      const [React, ReactDOMClient, LucideReact] = await Promise.all([
+        import('https://esm.sh/react@18.3.1'),
+        import('https://esm.sh/react-dom@18.3.1/client'),
+        import('https://esm.sh/lucide-react@0.383.0?deps=react@18.3.1')
+      ]);
+      window.React = React.default || React;
+      // createRoot lives on the default export of react-dom/client
+      window.ReactDOM = { createRoot: (ReactDOMClient.createRoot || (ReactDOMClient.default && ReactDOMClient.default.createRoot)) };
+      window.LucideReact = LucideReact;
+
+      // Stage 2: load Babel-standalone, compile the JSX, run it.
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/@babel/standalone@7.24.7/babel.min.js';
+        s.onload = resolve;
+        s.onerror = () => reject(new Error('Failed to load Babel. Check your connection.'));
+        document.head.appendChild(s);
+      });
+
+      const src = document.getElementById('app-src').textContent;
+      const compiled = Babel.transform(src, {
+        presets: [['react', { runtime: 'classic' }]],
+        filename: 'app.jsx'
+      }).code;
+
+      // Run in global scope
+      (0, eval)(compiled);
+    } catch (err) {
+      console.error('Arcanum boot error:', err);
+      const el = document.getElementById('loading');
+      if (el) {
+        el.className = 'error';
+        el.innerHTML =
+          '<div><strong>Failed to start.</strong><br><br>' +
+          (err && err.message ? err.message.replace(/</g,'&lt;') : String(err)) +
+          '<br><br><span style="color:#a8a291; font-size:12px;">Open the browser console (F12) for details.</span></div>';
+      }
+    }
+  </script>
+
+  <!-- The raw JSX, read by the loader above. type="text/plain" prevents
+       the browser from trying to execute it. -->
+  <script type="text/plain" id="app-src">
+// Pull everything off globals seeded by the loader
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+const {
   Shield, Swords, Users, Eye, EyeOff, Plus, Minus, X, Search,
-  Map as MapIcon, Layers, Settings, LogOut, Play, Pause, Crown,
+  Map: MapIcon, Layers, Settings, LogOut, Play, Pause, Crown,
   ChevronRight, Download, Upload, User, Trash2, Heart, Sparkles,
   Save, FolderOpen, Lock, ZoomIn, ZoomOut, RotateCcw, Target,
   Circle, Square, Diamond, Skull, Edit3, ChevronDown, Copy,
-  Swords as SwordsIcon, MoreVertical, UserCheck, Wifi, WifiOff,
+  Swords: SwordsIcon, MoreVertical, UserCheck, Wifi, WifiOff,
   ArrowRightCircle, Radio, Gem, Scroll, Dices, ChevronLeft,
   PlusCircle, AlertCircle, Link2, Flag, Home
-} from 'lucide-react';
+} = LucideReact;
+
 
 // ============================================================
 //  CONSTANTS & DEFAULTS
@@ -339,7 +448,7 @@ function ThemeStyles() {
 //  MAIN APP
 // ============================================================
 
-export default function App() {
+function App() {
   const [booted, setBooted] = useState(false);
   const [mode, setMode] = useState('login'); // login | dm | player
   const [playerName, setPlayerName] = useState('');
@@ -2765,3 +2874,14 @@ function CreatePCModal({ onClose, onCreate }) {
     </div>
   );
 }
+
+
+// Mount the app
+const rootEl = document.getElementById('root');
+ReactDOM.createRoot(rootEl).render(React.createElement(App));
+const loader = document.getElementById('loading');
+if (loader) loader.style.display = 'none';
+
+  </script>
+</body>
+</html>
